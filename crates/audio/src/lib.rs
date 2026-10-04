@@ -1,5 +1,6 @@
 //! Decoding and DSP happen outside the CPAL callback. The callback only reads
-//! an immutable stereo mix and bounded atomic transport controls.
+//! an immutable stereo mix and bounded atomic transport controls, and synthesizes
+//! the short metronome click without allocations.
 use anyhow::{bail, ensure, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
@@ -277,6 +278,35 @@ pub struct PlaybackState {
     pub playing: AtomicBool,
     pub frame: AtomicU64,
     pub failed: AtomicBool,
+    // Pack both frame boundaries into one atomic so the callback sees a coherent range.
+    // Zero disables looping; the renderer's 64M-frame limit fits in 32 bits.
+    loop_frames: AtomicU64,
+    metronome_bpm: AtomicU64,
+}
+impl PlaybackState {
+    fn set_metronome(&self, bpm: Option<f64>) {
+        self.metronome_bpm.store(
+            bpm.filter(|bpm| bpm.is_finite() && (20.0..=400.0).contains(bpm))
+                .map_or(0, f64::to_bits),
+            Ordering::Relaxed,
+        );
+    }
+    fn set_loop(&self, range: Option<(f64, f64)>, rate: u32) {
+        let packed = range
+            .filter(|(start, end)| {
+                start.is_finite() && end.is_finite() && *start >= 0.0 && end > start
+            })
+            .map_or(0, |(start, end)| {
+                let start = (start * rate as f64).round().min(u32::MAX as f64) as u64;
+                let end = (end * rate as f64).round().min(u32::MAX as f64) as u64;
+                if end > start {
+                    (start << 32) | end
+                } else {
+                    0
+                }
+            });
+        self.loop_frames.store(packed, Ordering::Relaxed);
+    }
 }
 /// UI-side ownership: retired buffers are freed here, never in render().
 struct MixUpdates {
@@ -335,10 +365,19 @@ impl PlaybackBuffer {
                 self.fade = 0;
             }
         }
+        let loop_frames = self.state.loop_frames.load(Ordering::Relaxed);
+        let loop_start = (loop_frames >> 32) as usize;
+        let loop_end = loop_frames as u32 as usize;
+        let bpm = f64::from_bits(self.state.metronome_bpm.load(Ordering::Relaxed));
+        let rate = self.mix.sample_rate;
         for frame in output.chunks_mut(channels) {
             let mut sample = [0.0; 2];
             if self.state.playing.load(Ordering::Relaxed) {
-                let index = self.state.frame.fetch_add(1, Ordering::Relaxed) as usize;
+                let mut index = self.state.frame.fetch_add(1, Ordering::Relaxed) as usize;
+                if loop_end > loop_start && (index >= loop_end || index < loop_start) {
+                    index = loop_start;
+                    self.state.frame.store(index as u64 + 1, Ordering::Relaxed);
+                }
                 if let Some(f) = self.mix.frames.get(index) {
                     sample = *f;
                     if let Some(old) = &self.previous {
@@ -348,8 +387,14 @@ impl PlaybackBuffer {
                             sample[c] = prior[c] + (sample[c] - prior[c]) * blend;
                         }
                     }
-                } else {
+                } else if loop_end <= loop_start {
                     self.state.playing.store(false, Ordering::Relaxed);
+                }
+                if bpm > 0.0 && self.state.playing.load(Ordering::Relaxed) {
+                    let click = metronome_click(index as u64, rate, bpm);
+                    for channel in &mut sample {
+                        *channel = (*channel + click).clamp(-1.0, 1.0);
+                    }
                 }
             }
             self.fade = (self.fade + 1).min(128);
@@ -372,6 +417,21 @@ impl PlaybackBuffer {
             }
         }
     }
+}
+fn metronome_click(frame: u64, rate: u32, bpm: f64) -> f32 {
+    let frames_per_beat = rate as f64 * 60.0 / bpm;
+    let beat = (frame as f64 / frames_per_beat).floor();
+    let seconds = (frame as f64 - beat * frames_per_beat) / rate as f64;
+    if seconds >= 0.035 {
+        return 0.0;
+    }
+    let accented = (beat as u64).is_multiple_of(4);
+    let frequency = if accented { 1760.0 } else { 1320.0 };
+    let volume = if accented { 0.3 } else { 0.2 };
+    (volume
+        * (std::f64::consts::TAU * frequency * seconds).sin()
+        * (-120.0 * seconds).exp()
+        * (seconds / 0.001).min(1.0)) as f32
 }
 impl Player {
     pub fn output_rate() -> Result<u32> {
@@ -396,6 +456,8 @@ impl Player {
             playing: AtomicBool::new(false),
             frame: AtomicU64::new((seconds * mix.sample_rate as f64) as u64),
             failed: AtomicBool::new(false),
+            loop_frames: AtomicU64::new(0),
+            metronome_bpm: AtomicU64::new(0),
         });
         let (updates, buffer) = PlaybackBuffer::new(mix, state.clone());
         let stream = match supported.sample_format() {
@@ -423,6 +485,12 @@ impl Player {
             (seconds.max(0.0) * self.sample_rate as f64) as u64,
             Ordering::Relaxed,
         );
+    }
+    pub fn set_loop(&self, range: Option<(f64, f64)>) {
+        self.state.set_loop(range, self.sample_rate);
+    }
+    pub fn set_metronome(&self, bpm: Option<f64>) {
+        self.state.set_metronome(bpm);
     }
     pub fn seconds(&self) -> f64 {
         self.state.frame.load(Ordering::Relaxed) as f64 / self.sample_rate as f64
@@ -466,11 +534,159 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
 mod tests {
     use super::*;
     #[test]
+    fn metronome_only_sounds_during_playback_and_follows_tempo_and_loops() {
+        let state = Arc::new(PlaybackState {
+            playing: AtomicBool::new(false),
+            frame: AtomicU64::new(1500),
+            failed: AtomicBool::new(false),
+            loop_frames: AtomicU64::new(0),
+            metronome_bpm: AtomicU64::new(0),
+        });
+        let mix = Arc::new(Mix {
+            sample_rate: 8000,
+            frames: vec![[0.0; 2]; 20000],
+            missing: vec![],
+            sources: vec![],
+            peak: 0.0,
+        });
+        let (_updates, mut buffer) = PlaybackBuffer::new(mix, state.clone());
+        let mut output = vec![0.0_f32; 40000];
+        buffer.render(&mut output, 2);
+        assert!(output.iter().all(|s| *s == 0.0));
+        state.set_metronome(Some(120.0));
+        buffer.render(&mut output, 2);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "Enabled metronome must be silent while stopped"
+        );
+        assert!(!state.playing.load(Ordering::Relaxed));
+        assert_eq!(state.frame.load(Ordering::Relaxed), 1500);
+        state.frame.store(0, Ordering::Relaxed);
+        state.playing.store(true, Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        let energy = |samples: &[f32]| samples.iter().map(|s| s * s).sum::<f32>();
+        for beat in 0..5 {
+            let start = beat * 8000;
+            assert!(energy(&output[start..start + 560]) > 0.1);
+            assert!(output[start + 560..start + 8000].iter().all(|s| *s == 0.0));
+        }
+        assert!(energy(&output[..560]) > energy(&output[8000..8560]) * 1.5);
+        state.playing.store(false, Ordering::Relaxed);
+        let cursor = state.frame.load(Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "Pause must silence the click"
+        );
+        assert_eq!(state.frame.load(Ordering::Relaxed), cursor);
+        state.frame.store(0, Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "Stop must silence the click at beat zero"
+        );
+        state.set_metronome(Some(240.0));
+        state.playing.store(true, Ordering::Relaxed);
+        buffer.render(&mut output[..8000], 2);
+        assert!(
+            energy(&output[4000..4560]) > 0.1,
+            "Tempo change must shorten the beat interval"
+        );
+        state.set_metronome(Some(120.0));
+        state.playing.store(true, Ordering::Relaxed);
+        state.frame.store(3984, Ordering::Relaxed);
+        buffer.render(&mut output[..128], 2);
+        assert!(output[..32].iter().all(|s| *s == 0.0));
+        assert!(
+            energy(&output[32..128]) > 0.01,
+            "Click must align with transport beat"
+        );
+        state.set_loop(Some((0.5, 1.0)), 8000);
+        state.frame.store(7984, Ordering::Relaxed);
+        buffer.render(&mut output[..128], 2);
+        assert!(output[..32].iter().all(|s| *s == 0.0));
+        assert!(
+            energy(&output[32..128]) > 0.01,
+            "Click must follow the loop boundary"
+        );
+        state.set_metronome(None);
+        buffer.render(&mut output, 2);
+        assert!(output.iter().all(|s| *s == 0.0));
+        state.set_loop(None, 8000);
+        state.set_metronome(Some(120.0));
+        state.frame.store(19996, Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        assert!(!state.playing.load(Ordering::Relaxed));
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "End of song must also silence the click"
+        );
+        for bpm in [f64::NAN, -1.0, 0.0, 401.0] {
+            state.set_metronome(Some(bpm));
+            assert_eq!(state.metronome_bpm.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[test]
+    fn loop_wraps_inside_the_audio_callback_without_silence_and_can_be_disabled() {
+        let state = Arc::new(PlaybackState {
+            playing: AtomicBool::new(true),
+            frame: AtomicU64::new(5),
+            failed: AtomicBool::new(false),
+            loop_frames: AtomicU64::new(0),
+            metronome_bpm: AtomicU64::new(0),
+        });
+        let mix = Arc::new(Mix {
+            sample_rate: 100,
+            frames: (0..10)
+                .map(|i| [i as f32 / 10.0, -(i as f32) / 10.0])
+                .collect(),
+            missing: vec![],
+            sources: vec![],
+            peak: 0.9,
+        });
+        let (_updates, mut buffer) = PlaybackBuffer::new(mix, state.clone());
+        state.set_loop(Some((0.05, 0.08)), 100);
+        let mut output = [0.0_f32; 28];
+        buffer.render(&mut output, 2);
+        for (i, frame) in output.as_chunks::<2>().0.iter().enumerate() {
+            let sample = (5 + i % 3) as f32 / 10.0;
+            assert_eq!(*frame, [sample, -sample]);
+        }
+        assert!(state.playing.load(Ordering::Relaxed));
+        state.frame.store(1, Ordering::Relaxed);
+        buffer.render(&mut output[..2], 2);
+        assert_eq!(&output[..2], &[0.5, -0.5]);
+        state.playing.store(false, Ordering::Relaxed);
+        let cursor = state.frame.load(Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        assert!(output.iter().all(|s| *s == 0.0));
+        assert_eq!(state.frame.load(Ordering::Relaxed), cursor);
+        state.set_loop(None, 100);
+        state.frame.store(7, Ordering::Relaxed);
+        state.playing.store(true, Ordering::Relaxed);
+        buffer.render(&mut output[..8], 2);
+        assert_eq!(&output[..8], &[0.7, -0.7, 0.8, -0.8, 0.9, -0.9, 0.0, 0.0]);
+        assert!(!state.playing.load(Ordering::Relaxed));
+        // A clip move can briefly put the loop beyond the previous live mix.
+        // Keep the transport alive until the updated mix arrives.
+        state.set_loop(Some((0.12, 0.15)), 100);
+        state.playing.store(true, Ordering::Relaxed);
+        buffer.render(&mut output, 2);
+        assert!(state.playing.load(Ordering::Relaxed));
+        assert!(output.iter().all(|s| *s == 0.0));
+        for range in [(f64::NAN, 1.0), (-1.0, 1.0), (1.0, 1.0), (2.0, 1.0)] {
+            state.set_loop(Some(range), 100);
+            assert_eq!(state.loop_frames.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[test]
     fn mix_swap_keeps_audio_running_at_the_current_frame() {
         let state = Arc::new(PlaybackState {
             playing: AtomicBool::new(true),
             frame: AtomicU64::new(400),
             failed: AtomicBool::new(false),
+            loop_frames: AtomicU64::new(0),
+            metronome_bpm: AtomicU64::new(0),
         });
         let mix = |sample| {
             Arc::new(Mix {

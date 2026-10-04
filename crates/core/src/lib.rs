@@ -499,6 +499,11 @@ pub enum Command {
         track_id: String,
         device_id: String,
     },
+    MoveDevice {
+        track_id: String,
+        device_id: String,
+        index: usize,
+    },
     SetDeviceParameter {
         track_id: String,
         device_id: String,
@@ -740,6 +745,20 @@ impl Session {
                 );
                 devices.retain(|d| d.id != device_id);
             }
+            Command::MoveDevice {
+                track_id,
+                device_id,
+                index,
+            } => {
+                let devices = p.devices_mut(&track_id)?;
+                ensure!(index < devices.len(), "Invalid device position");
+                let from = devices
+                    .iter()
+                    .position(|d| d.id == device_id)
+                    .context("Device not found")?;
+                let device = devices.remove(from);
+                devices.insert(index, device);
+            }
             Command::SetDeviceParameter {
                 track_id,
                 device_id,
@@ -812,6 +831,82 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reorder_devices_is_validated_undoable_and_persists_for_tracks_and_master() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::new(Project::new("Order"), root.path().into());
+        session
+            .execute(Command::AddTrack {
+                name: "Audio".into(),
+            })
+            .unwrap();
+        let track = session.project.tracks[0].id.clone();
+        for target in [track, "master".into()] {
+            for kind in ["builtin.gain", "builtin.eq8", "builtin.limiter"] {
+                session
+                    .execute(Command::AddDevice {
+                        track_id: target.clone(),
+                        kind: kind.into(),
+                    })
+                    .unwrap();
+            }
+            let before = session.project.clone();
+            let id = before.devices(&target).unwrap()[0].id.clone();
+            session
+                .execute(Command::MoveDevice {
+                    track_id: target.clone(),
+                    device_id: id.clone(),
+                    index: 2,
+                })
+                .unwrap();
+            assert_eq!(session.project.devices(&target).unwrap()[2].id, id);
+            assert!(session.undo());
+            assert_eq!(session.project, before);
+            assert!(session.redo());
+            let reordered = session.project.clone();
+            let revision = session.revision;
+            session
+                .execute(Command::MoveDevice {
+                    track_id: target.clone(),
+                    device_id: id.clone(),
+                    index: 2,
+                })
+                .unwrap();
+            assert_eq!(
+                session.revision, revision,
+                "Dropping in place must not add history"
+            );
+            for (device_id, index) in [(id.clone(), 3), ("missing".into(), 0)] {
+                assert!(session
+                    .execute(Command::MoveDevice {
+                        track_id: target.clone(),
+                        device_id,
+                        index
+                    })
+                    .is_err());
+                assert_eq!(session.project, reordered);
+                assert_eq!(session.revision, revision);
+            }
+            session
+                .execute(Command::MoveDevice {
+                    track_id: target.clone(),
+                    device_id: id.clone(),
+                    index: 0,
+                })
+                .unwrap();
+            assert_eq!(session.project, before);
+            session.execute(Command::SaveProject).unwrap();
+            assert_eq!(
+                Session::open(root.path())
+                    .unwrap()
+                    .project
+                    .devices(&target)
+                    .unwrap()[0]
+                    .id,
+                id
+            );
+        }
+    }
     #[test]
     fn effects_validate_ranges_preserve_history_and_roundtrip_master_chain() {
         let root = tempfile::tempdir().unwrap();

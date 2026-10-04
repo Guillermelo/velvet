@@ -18,3 +18,14 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 tempfile = "3"
 
+# Keep the animated native UI smooth in the default development build.
+[profile.dev.package.velvet-app]
+opt-level = 2
+
+[profile.dev.package.epaint]
+opt-level = 2
+
+# Prepare audio mixes quickly in development builds too.
+[profile.dev.package.velvet-audio]
+opt-level = 2
+

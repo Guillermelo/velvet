@@ -1,11 +1,25 @@
 use super::*;
 use velvet_core::{Device, BUILTIN_DEVICES};
 
+struct DeviceDrag {
+    target: String,
+    device: String,
+}
+
 impl Velvet {
     pub(super) fn rack(&mut self, ctx: &egui::Context) {
+        let tall = self
+            .selected_track
+            .as_deref()
+            .and_then(|target| self.session.project.devices(target).ok())
+            .is_some_and(|devices| {
+                devices
+                    .iter()
+                    .any(|d| matches!(d.kind.as_str(), "builtin.eq8" | "builtin.compressor"))
+            });
         egui::TopBottomPanel::bottom("rack")
-            .default_height(248.0)
-            .height_range(230.0..=400.0)
+            .default_height(if tall { 238.0 } else { 180.0 })
+            .height_range(if tall { 220.0..=400.0 } else { 170.0..=400.0 })
             .resizable(true)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
             .show(ctx, |ui| {
@@ -21,6 +35,11 @@ impl Velvet {
                     else {
                         return;
                     };
+                    if self.selected_device.as_ref().is_some_and(|(track, id)| {
+                        track != &target || !devices.iter().any(|d| &d.id == id)
+                    }) {
+                        self.selected_device = None;
+                    }
                     let name = if target == "master" {
                         "Master"
                     } else {
@@ -30,28 +49,45 @@ impl Velvet {
                         eyebrow(ui, "DEVICE CHAIN");
                         ui.label(egui::RichText::new(format!("/ {name}")).color(MUTED));
                     });
-                    let height = (ui.available_height() - 14.0).max(180.0);
+                    let height =
+                        (ui.available_height() - 14.0).max(if tall { 172.0 } else { 120.0 });
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
+                        .drag_to_scroll(false)
                         .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 3.0;
+                            ui.spacing_mut().item_spacing.x = 7.0;
                             ui.horizontal_top(|ui| {
-                                for device in &devices {
+                                for (index, device) in devices.iter().enumerate() {
                                     ui.push_id(&device.id, |ui| {
                                         let width = match device.kind.as_str() {
                                             "builtin.eq8" => 580.0,
                                             "builtin.gain" => 130.0,
                                             _ => 252.0,
                                         };
-                                        let (rect, _) = ui.allocate_exact_size(
+                                        let (rect, response) = ui.allocate_exact_size(
                                             Vec2::new(width, height),
                                             Sense::hover(),
                                         );
-                                        ui.painter().rect_filled(rect, 2.0, BG);
+                                        let hovered = ui.input(|i| i.pointer.hover_pos())
+                                            .is_some_and(|p| rect.intersect(ui.clip_rect()).contains(p));
+                                        if hovered && ui.input(|i| i.pointer.primary_pressed()) {
+                                            self.selected_device = Some((target.clone(), device.id.clone()));
+                                            self.selected_clip = None;
+                                        }
+                                        let selected = self.selected_device.as_ref()
+                                            == Some(&(target.clone(), device.id.clone()));
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            4.0,
+                                            Color32::from_rgb(18, 20, 25),
+                                        );
                                         ui.painter().rect_stroke(
                                             rect,
-                                            2.0,
-                                            Stroke::new(1.0_f32, LINE),
+                                            4.0,
+                                            Stroke::new(
+                                                if selected { 1.5_f32 } else { 0.5_f32 },
+                                                if selected { CYAN } else if hovered { MUTED } else { LINE },
+                                            ),
                                             egui::StrokeKind::Inside,
                                         );
                                         let title =
@@ -59,8 +95,27 @@ impl Velvet {
                                         ui.painter().rect_filled(
                                             title,
                                             2.0,
-                                            Color32::from_rgb(48, 52, 57),
+                                            if selected { Color32::from_rgb(24, 48, 56) }
+                                            else if hovered { Color32::from_rgb(28, 31, 38) }
+                                            else { Color32::from_rgb(18, 20, 25) },
                                         );
+                                        let handle = ui.interact(
+                                            Rect::from_min_max(title.min, title.max - Vec2::new(28.0, 0.0)),
+                                            ui.id().with("device_drag"),
+                                            Sense::click_and_drag(),
+                                        ).on_hover_text("Drag to reorder · Backspace to remove selected effect");
+                                        if handle.clicked() || handle.drag_started() {
+                                            self.selected_device = Some((target.clone(), device.id.clone()));
+                                            self.selected_clip = None;
+                                        }
+                                        handle.dnd_set_drag_payload(DeviceDrag {
+                                            target: target.clone(), device: device.id.clone(),
+                                        });
+                                        let before = ui.input(|i| i.pointer.hover_pos())
+                                            .is_some_and(|p| p.x < rect.center().x);
+                                        self.device_drop(ui, &response, &target, &devices,
+                                            index + usize::from(!before),
+                                            if before { rect.left() - 3.0 } else { rect.right() + 3.0 });
                                         ui.scope_builder(
                                             egui::UiBuilder::new()
                                                 .max_rect(title.shrink2(Vec2::new(5.0, 1.0)))
@@ -68,6 +123,7 @@ impl Velvet {
                                                     egui::Align::Center,
                                                 )),
                                             |ui| {
+                                                ui.style_mut().interaction.selectable_labels = false;
                                                 let (dot, _) = ui.allocate_exact_size(
                                                     Vec2::splat(9.0),
                                                     Sense::hover(),
@@ -78,11 +134,17 @@ impl Velvet {
                                                     ACCENT,
                                                 );
                                                 ui.label(
-                                                    BUILTIN_DEVICES
-                                                        .iter()
-                                                        .find(|(_, kind, _)| *kind == device.kind)
-                                                        .unwrap()
-                                                        .0,
+                                                    egui::RichText::new(
+                                                        BUILTIN_DEVICES
+                                                            .iter()
+                                                            .find(|(_, kind, _)| {
+                                                                *kind == device.kind
+                                                            })
+                                                            .unwrap()
+                                                            .0,
+                                                    )
+                                                    .monospace()
+                                                    .size(10.0),
                                                 );
                                                 ui.with_layout(
                                                     egui::Layout::right_to_left(
@@ -115,10 +177,15 @@ impl Velvet {
                                     });
                                 }
                                 let width = ui.available_width().max(190.0);
-                                let (rect, _) = ui
+                                let (rect, response) = ui
                                     .allocate_exact_size(Vec2::new(width, height), Sense::hover());
-                                ui.painter()
-                                    .rect_filled(rect, 2.0, Color32::from_rgb(34, 37, 41));
+                                self.device_drop(ui, &response, &target, &devices, devices.len(), rect.left() - 3.0);
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    4.0,
+                                    Stroke::new(0.5_f32, LINE),
+                                    egui::StrokeKind::Inside,
+                                );
                                 ui.scope_builder(
                                     egui::UiBuilder::new()
                                         .max_rect(rect.shrink(12.0))
@@ -146,6 +213,46 @@ impl Velvet {
                         });
                 });
             });
+    }
+    fn device_drop(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        target: &str,
+        devices: &[Device],
+        insertion: usize,
+        x: f32,
+    ) {
+        if !ui
+            .input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| response.rect.intersect(ui.clip_rect()).contains(p))
+        {
+            return;
+        }
+        let Some(payload) = egui::DragAndDrop::payload::<DeviceDrag>(ui.ctx()) else {
+            return;
+        };
+        if payload.target != target {
+            return;
+        }
+        ui.painter().line_segment(
+            [
+                Pos2::new(x, response.rect.top()),
+                Pos2::new(x, response.rect.bottom()),
+            ],
+            Stroke::new(2.0_f32, CYAN),
+        );
+        if ui.input(|i| i.pointer.any_released()) {
+            let payload = egui::DragAndDrop::take_payload::<DeviceDrag>(ui.ctx()).unwrap();
+            if let Some(from) = devices.iter().position(|d| d.id == payload.device) {
+                let index = insertion - usize::from(from < insertion);
+                self.execute(Command::MoveDevice {
+                    track_id: target.into(),
+                    device_id: payload.device.clone(),
+                    index,
+                });
+            }
+        }
     }
     fn set_device_parameter(&mut self, target: &str, device: &Device, parameter: &str, value: f64) {
         self.execute(Command::SetDeviceParameter {
@@ -234,7 +341,7 @@ fn parameter_knob(
                 || parameter.ends_with("_ms");
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(label).small().color(MUTED));
-                let size = if compact { 24.0 } else { 46.0 };
+                let size = if compact { 24.0 } else { 34.0 };
                 let (rect, response) =
                     ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
                 let response = response
@@ -264,7 +371,7 @@ fn parameter_knob(
                     |angle: f32, radius: f32| center + Vec2::new(angle.cos(), angle.sin()) * radius;
                 let radius = size / 2.0 - 3.0;
                 ui.painter()
-                    .circle_filled(center, radius - 4.0, Color32::from_rgb(38, 42, 46));
+                    .circle_filled(center, radius - 4.0, Color32::from_rgb(17, 19, 23));
                 for (fraction, color) in [(1.0, LINE), (amount, ACCENT)] {
                     let points = (0..=32)
                         .map(|i| point(start + sweep * fraction * i as f32 / 32.0, radius))
@@ -570,6 +677,107 @@ impl Velvet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn effect_header_selects_highlights_reorders_both_directions_and_deletes() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Device gestures"), PathBuf::new());
+        app.job = None;
+        app.selected_track = Some("master".into());
+        for kind in ["builtin.gain", "builtin.compressor", "builtin.limiter"] {
+            app.execute(Command::AddDevice {
+                track_id: "master".into(),
+                kind: kind.into(),
+            });
+        }
+        let gain = app.session.project.master_devices[0].id.clone();
+        let render = |app: &mut Velvet, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.shortcuts(ctx);
+                    app.rack(ctx);
+                },
+            )
+        };
+        let label = |output: &egui::FullOutput, name: &str| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(t) if t.galley.job.text == name => {
+                        Some(t.pos + t.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .min_by(|a, b| a.y.total_cmp(&b.y))
+                .unwrap()
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = render(&mut app, vec![]);
+        let output = render(&mut app, vec![]);
+        let source = label(&output, "Gain");
+        let destination = label(&output, "Limiter") + Vec2::new(165.0, 40.0);
+        let _ = render(
+            &mut app,
+            vec![egui::Event::PointerMoved(source), button(source, true)],
+        );
+        let _ = render(
+            &mut app,
+            vec![egui::Event::PointerMoved(source + Vec2::new(15.0, 0.0))],
+        );
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<DeviceDrag>(&ctx),
+            "Header did not start an effect drag"
+        );
+        let output = render(&mut app, vec![egui::Event::PointerMoved(destination)]);
+        assert_eq!(app.selected_device, Some(("master".into(), gain.clone())));
+        assert!(output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.stroke.color == CYAN && r.stroke.width == 1.5)));
+        let _ = render(&mut app, vec![button(destination, false)]);
+        assert_eq!(app.session.project.master_devices[2].id, gain);
+        let output = render(&mut app, vec![]);
+        let source = label(&output, "Gain");
+        let destination = label(&output, "Compressor") + Vec2::new(0.0, 40.0);
+        let _ = render(
+            &mut app,
+            vec![egui::Event::PointerMoved(source), button(source, true)],
+        );
+        let _ = render(
+            &mut app,
+            vec![egui::Event::PointerMoved(source + Vec2::new(15.0, 0.0))],
+        );
+        let _ = render(&mut app, vec![egui::Event::PointerMoved(destination)]);
+        let _ = render(&mut app, vec![button(destination, false)]);
+        assert_eq!(app.session.project.master_devices[0].id, gain);
+        let _ = render(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.session.project.master_devices.len(), 2);
+        assert!(app
+            .session
+            .project
+            .master_devices
+            .iter()
+            .all(|d| d.id != gain));
+        app.history(false);
+        assert_eq!(app.session.project.master_devices[0].id, gain);
+    }
     #[test]
     fn dragging_eq_node_edits_frequency_and_gain_without_pausing() {
         let ctx = egui::Context::default();
