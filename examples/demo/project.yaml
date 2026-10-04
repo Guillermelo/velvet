@@ -1,0 +1,184 @@
+format: 1
+project:
+  id: project_e5ea51613d6e4707b6c9d28a5677f7e7
+  name: Quiet hours
+audio:
+  sample_rate: 48000
+tempo:
+  bpm: 120.0
+master:
+  volume_db: 0.0
+  pan: 0.0
+  mute: false
+  solo: false
+tracks:
+- id: track_7c7f35d51f1b44d898e417e03abb57a6
+  name: Drums
+  type: audio
+  color:
+  - 168
+  - 147
+  - 112
+  mixer:
+    volume_db: -3.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips:
+  - id: clip_1ebfc9dcf21d4dff98ba46f69391cb73
+    source:
+      path: generated\drums.wav
+      kind: project
+    position:
+      start_beats: 0.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_e15fa8dfd8dd4f2a97a382cb0532aee2
+    source:
+      path: generated\drums.wav
+      kind: project
+    position:
+      start_beats: 16.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_3b90ce070d4c403e9e5863e199a68266
+    source:
+      path: generated\drums.wav
+      kind: project
+    position:
+      start_beats: 32.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  devices:
+  - id: device_4b4bc4cfcbfe4941b266134ce43541a0
+    type: builtin.gain
+    parameters:
+      gain_db: 0.0
+  - id: device_ebade6c1288741caa64d7de829875ade
+    type: builtin.eq
+    parameters:
+      high_gain_db: 10.0
+      low_gain_db: 0.0
+      mid_gain_db: 0.0
+- id: track_a53544b03f744ed590ce6df726a7649c
+  name: Bass
+  type: audio
+  color:
+  - 130
+  - 157
+  - 155
+  mixer:
+    volume_db: -3.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips:
+  - id: clip_028d71aaae0248baa8de6c95af575095
+    source:
+      path: generated\bass.wav
+      kind: project
+    position:
+      start_beats: 8.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_2a4f382895034b96a1010f13c6a49b16
+    source:
+      path: generated\bass.wav
+      kind: project
+    position:
+      start_beats: 24.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_c4eb134239b54440b011d7637a9f7cb3
+    source:
+      path: generated\bass.wav
+      kind: project
+    position:
+      start_beats: 40.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  devices:
+  - id: device_54b28942d2bd4f089cd7f2d445d1e4af
+    type: builtin.gain
+    parameters:
+      gain_db: 5.0
+  - id: device_4a0b95bdd20c4047a236eca35a442898
+    type: builtin.eq
+    parameters:
+      high_gain_db: 0.0
+      low_gain_db: 2.0
+      mid_gain_db: 6.5
+- id: track_601aa7cf8dde47bd86cf88e1ff32093c
+  name: Keys
+  type: audio
+  color:
+  - 159
+  - 140
+  - 167
+  mixer:
+    volume_db: -3.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips:
+  - id: clip_ad8a34bfe00540e1990b89d62d5f4332
+    source:
+      path: generated\keys.wav
+      kind: project
+    position:
+      start_beats: 16.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_042842fd35044848951f5362fa1f2cdf
+    source:
+      path: generated\keys.wav
+      kind: project
+    position:
+      start_beats: 32.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  devices:
+  - id: device_0ea978a8efa64937bb501dcf04f4e1f9
+    type: builtin.gain
+    parameters:
+      gain_db: 0.0
+  - id: device_c106dcf8cd9a425bab3285d844e64949
+    type: builtin.eq
+    parameters:
+      high_gain_db: 12.0
+      low_gain_db: 0.0
+      mid_gain_db: 10.5
+- id: track_960b260ce81a473884fde64429529f66
+  name: Atmosphere
+  type: audio
+  color:
+  - 131
+  - 148
+  - 175
+  mixer:
+    volume_db: -3.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips:
+  - id: clip_575a44a2773e46958845cacc71869944
+    source:
+      path: generated\atmosphere.wav
+      kind: project
+    position:
+      start_beats: 0.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  - id: clip_46f40fd09e654536a8742ce477ff3652
+    source:
+      path: generated\atmosphere.wav
+      kind: project
+    position:
+      start_beats: 32.0
+      offset_seconds: 0.0
+      length_seconds: 8.0
+  devices:
+  - id: device_46458d340b084e4c93ecaa587aef1048
+    type: builtin.gain
+    parameters:
+      gain_db: 0.0

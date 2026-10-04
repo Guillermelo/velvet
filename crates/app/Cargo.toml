@@ -1,0 +1,23 @@
+[package]
+name = "velvet-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "velvet-app"
+path = "src/main.rs"
+
+[dependencies]
+velvet-core.workspace = true
+velvet-audio.workspace = true
+velvet-ai.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+

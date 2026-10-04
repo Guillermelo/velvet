@@ -1,0 +1,15 @@
+[package]
+name = "velvet-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+velvet-core.workspace = true
+anyhow.workspace = true
+cpal = "0.15.3"
+symphonia = { version = "0.5.4", default-features = false, features = ["wav", "pcm", "flac"] }
+hound = "3.5"
+tempfile.workspace = true
+rtrb = "0.3"
+

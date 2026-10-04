@@ -1,0 +1,7 @@
+/target/
+*.autosave.yaml
+.velvet-history.json
+.env
+.env.*
+!.env.example
+
