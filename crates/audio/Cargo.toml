@@ -12,4 +12,5 @@ symphonia = { version = "0.5.4", default-features = false, features = ["wav", "p
 hound = "3.5"
 tempfile.workspace = true
 rtrb = "0.3"
+vst3-host = { version = "0.9", default-features = false, features = ["process-isolation"] }
 

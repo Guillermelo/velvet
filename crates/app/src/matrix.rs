@@ -40,6 +40,20 @@ impl Default for MatrixView {
     }
 }
 impl MatrixView {
+    fn columns(&self, rect: Rect, pitch: f32, arrangement: bool) -> (f32, f32, i32, i32) {
+        let (pitch, offset) = if arrangement {
+            (
+                22.0 / musical_grid_divisions(self.scale_x * 22.0) as f32,
+                0.0,
+            )
+        } else {
+            (pitch, 0.5)
+        };
+        let first = (((rect.left() - self.origin.x) / self.scale_x) / pitch - offset).ceil() as i32;
+        let last =
+            (((rect.right() - self.origin.x) / self.scale_x) / pitch - offset).floor() as i32;
+        (pitch, offset, first, last)
+    }
     fn screen_y(&self, world_y: f32) -> f32 {
         if world_y < 0.0 {
             return self.origin.y + world_y;
@@ -153,10 +167,8 @@ impl ParticleMatrix {
             ..Default::default()
         });
         let field_size = *self.field_size.get_or_insert(rect.size());
-        let first_column =
-            (((rect.left() - view.origin.x) / view.scale_x) / PITCH - 0.5).ceil() as i32;
-        let last_column =
-            (((rect.right() - view.origin.x) / view.scale_x) / PITCH - 0.5).floor() as i32;
+        let (pitch_x, offset_x, first_column, last_column) =
+            view.columns(rect, PITCH, self.view.is_some());
         let first_row = (view.world_y(rect.top()) / PITCH - 0.5).ceil() as i32;
         let last_row = (view.world_y(rect.bottom()) / PITCH - 0.5).floor() as i32;
         let columns = (last_column - first_column + 1).max(0) as usize;
@@ -185,7 +197,7 @@ impl ParticleMatrix {
             let world_y = (row as f32 + 0.5) * PITCH;
             let screen_y = view.screen_y(world_y);
             for column in first_column..=last_column {
-                let world_x = (column as f32 + 0.5) * PITCH;
+                let world_x = (column as f32 + offset_x) * pitch_x;
                 let base = Pos2::new(view.origin.x + world_x * view.scale_x, screen_y);
                 let u = world_x / field_size.x;
                 let v = world_y / field_size.y;
@@ -240,11 +252,22 @@ impl ParticleMatrix {
         vec![egui::Shape::mesh(glow), egui::Shape::mesh(mesh)]
     }
 
-    // Preserve the original pattern, including its cursor spring and timing.
     fn paint_crossing_waves(&mut self, ctx: &egui::Context, rect: Rect) -> Vec<egui::Shape> {
         let pitch = 7.0;
-        let columns = (rect.width().max(0.0) / pitch).ceil() as usize;
-        let rows = (rect.height().max(0.0) / pitch).ceil() as usize;
+        if !rect.is_positive() {
+            return Vec::new();
+        }
+        let arrangement = self.view.is_some();
+        let view = self.view.clone().unwrap_or(MatrixView {
+            origin: rect.min,
+            ..Default::default()
+        });
+        let field_size = *self.field_size.get_or_insert(rect.size());
+        let (pitch_x, offset_x, first_column, last_column) = view.columns(rect, pitch, arrangement);
+        let first_row = (view.world_y(rect.top()) / pitch - 0.5).ceil() as i32;
+        let last_row = (view.world_y(rect.bottom()) / pitch - 0.5).floor() as i32;
+        let columns = (last_column - first_column + 1).max(0) as usize;
+        let rows = (last_row - first_row + 1).max(0) as usize;
         if columns == 0 || rows == 0 {
             return Vec::new();
         }
@@ -264,13 +287,14 @@ impl ParticleMatrix {
         mesh.vertices.reserve(self.particles.len() * 4);
         mesh.indices.reserve(self.particles.len() * 6);
         for (i, particle) in self.particles.iter_mut().enumerate() {
-            let base = rect.min
-                + Vec2::new(
-                    (i % columns) as f32 * pitch + pitch / 2.0,
-                    (i / columns) as f32 * pitch + pitch / 2.0,
-                );
-            let u = (base.x - rect.left()) / rect.width();
-            let v = (base.y - rect.top()) / rect.height();
+            let world_x = (first_column as f32 + (i % columns) as f32 + offset_x) * pitch_x;
+            let world_y = (first_row as f32 + (i / columns) as f32 + 0.5) * pitch;
+            let base = Pos2::new(
+                view.origin.x + world_x * view.scale_x,
+                view.screen_y(world_y),
+            );
+            let u = world_x / field_size.x;
+            let v = world_y / field_size.y;
             let cyan_path = 0.77 - 0.40 * u + 0.065 * (u * 8.0 - time * 1.1).sin();
             let rose_path = 0.39 + 0.43 * u + 0.060 * (u * 7.0 + time * 0.95).cos();
             let width = 0.045 + 0.012 * (u * 5.0 + time * 0.65).sin();
@@ -297,11 +321,28 @@ impl ParticleMatrix {
                 color_channel(205.0, 248.0, 161.0, 246.0),
                 alpha,
             );
-            dot(&mut mesh, base + particle.offset, radius, color);
+            dot(
+                &mut mesh,
+                base + if arrangement {
+                    Vec2::ZERO
+                } else {
+                    particle.offset
+                },
+                radius,
+                color,
+            );
         }
         let mut shapes = vec![egui::Shape::mesh(mesh)];
         for x in [0.05, 0.36, 0.67, 0.95] {
-            let center = rect.min + Vec2::new(rect.width() * x, rect.height() * 0.57);
+            let world_x = if arrangement {
+                (field_size.x * x / pitch_x).round() * pitch_x
+            } else {
+                field_size.x * x
+            };
+            let center = Pos2::new(
+                view.origin.x + world_x * view.scale_x,
+                view.screen_y(field_size.y * 0.57),
+            );
             shapes.push(egui::Shape::line_segment(
                 [center - Vec2::new(4.0, 0.0), center + Vec2::new(4.0, 0.0)],
                 Stroke::new(0.5_f32, ROSE.gamma_multiply(0.35)),
@@ -450,6 +491,114 @@ fn dot(mesh: &mut egui::Mesh, center: Pos2, radius: f32, color: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn matrix_graphics_keep_their_world_position_when_zooming_and_panning() {
+        for preset in [MatrixPreset::FluidGrid, MatrixPreset::CrossingWaves] {
+            let ctx = egui::Context::default();
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+            let mut matrix = ParticleMatrix {
+                preset,
+                ..Default::default()
+            };
+            let mut original_color = None;
+            for scale in [1.0, 2.0, 4.0] {
+                let origin = Pos2::new(-2.75 * scale, -10.0);
+                matrix.view = Some(MatrixView {
+                    origin,
+                    scale_x: scale,
+                    ..Default::default()
+                });
+                let output = ctx.run(
+                    egui::RawInput {
+                        time: Some(0.0),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.layer_painter(egui::LayerId::background())
+                            .extend(matrix.paint(ctx, rect, 120.0, None));
+                    },
+                );
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh) => Some(mesh),
+                        _ => None,
+                    })
+                    .max_by_key(|mesh| mesh.vertices.len())
+                    .unwrap();
+                let world_y = if preset == MatrixPreset::FluidGrid {
+                    35.0
+                } else {
+                    31.5
+                };
+                let target = Pos2::new(origin.x + 88.0 * scale, origin.y + world_y);
+                let color = mesh
+                    .vertices
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .find(|quad| quad[0].pos.lerp(quad[3].pos, 0.5).distance(target) < 0.001)
+                    .expect("The same beat must remain visible")[0]
+                    .color;
+                assert_eq!(
+                    *original_color.get_or_insert(color),
+                    color,
+                    "Zoom/pan moved the graph to a different beat"
+                );
+            }
+        }
+    }
+    #[test]
+    fn arrangement_matrix_columns_land_on_musical_grid_for_both_presets() {
+        for preset in [MatrixPreset::FluidGrid, MatrixPreset::CrossingWaves] {
+            for zoom in [8.0, 22.0, 44.0, 88.0] {
+                let ctx = egui::Context::default();
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0));
+                let origin = Pos2::new(-3.125 * zoom, -25.0);
+                let mut matrix = ParticleMatrix {
+                    preset,
+                    view: Some(MatrixView {
+                        origin,
+                        scale_x: zoom / 22.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let step = zoom
+                    / if zoom >= 32.0 {
+                        4.0
+                    } else if zoom >= 16.0 {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                let output = ctx.run(egui::RawInput::default(), |ctx| {
+                    ctx.layer_painter(egui::LayerId::background())
+                        .extend(matrix.paint(ctx, rect, 120.0, None));
+                });
+                let mesh = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Mesh(mesh) => Some(mesh),
+                        _ => None,
+                    })
+                    .max_by_key(|mesh| mesh.vertices.len())
+                    .unwrap();
+                for quad in mesh.vertices.as_chunks::<4>().0 {
+                    let center = quad[0].pos.lerp(quad[3].pos, 0.5);
+                    let tick = (center.x - origin.x) / step;
+                    assert!(
+                        (tick - tick.round()).abs() < 0.0001,
+                        "{} dot at {} missed the musical grid at {zoom} px/beat",
+                        preset.label(),
+                        center.x
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn hover_and_tempo_motion_preserve_the_grid_and_follow_transport() {
         fn frame(
@@ -915,5 +1064,87 @@ mod tests {
         assert!(particle.velocity.length() < 0.01);
         particle.step(base, Some(base), 1.0 / 30.0);
         assert!(particle.offset.x.is_finite() && particle.offset.y.is_finite());
+    }
+}
+
+/// The oscillator uses the background matrix's dot texture and brightness-field rendering.
+pub(super) fn oscillator_matrix(ui: &egui::Ui, rect: Rect, wave: u8) {
+    let texture_id = egui::Id::new("oscillator_matrix_texture");
+    let texture = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<egui::TextureHandle>(texture_id))
+        .unwrap_or_else(|| {
+            let texture = dot_texture(ui.ctx());
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(texture_id, texture.clone()));
+            texture
+        });
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    let phase = ui.input(|i| i.time) * 0.12;
+    let pitch = 5.0;
+    let columns = ((rect.width() - 8.0) / pitch).floor() as usize;
+    let rows = ((rect.height() - 8.0) / pitch).floor() as usize;
+    let origin = rect.center() - Vec2::new(columns as f32, rows as f32) * pitch * 0.5;
+    for x in 0..=columns {
+        let u = x as f64 / columns.max(1) as f64;
+        let sample =
+            velvet_audio::synth::oscillator_c4(u * 3.0 + phase, wave).clamp(-1.0, 1.0) as f32;
+        let wave_y = rect.center().y - sample * rect.height() * 0.34;
+        for y in 0..=rows {
+            let base = origin + Vec2::new(x as f32, y as f32) * pitch;
+            let distance = (base.y - wave_y).abs();
+            let strength = (-distance.powi(2) / 14.0).exp();
+            let hover = ui
+                .input(|i| i.pointer.hover_pos())
+                .filter(|p| rect.contains(*p))
+                .map_or(0.0, |p| (-(base - p).length_sq() / 1600.0).exp() * 0.10);
+            let alpha = ((0.10 + strength * 0.80 + hover) * 255.0) as u8;
+            let color = Color32::from_rgba_unmultiplied(153, 218, 237, alpha);
+            dot(&mut mesh, base, 0.60 + strength * 0.85, color);
+        }
+    }
+    ui.painter()
+        .with_clip_rect(rect)
+        .add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod oscillator_tests {
+    use super::*;
+    #[test]
+    fn oscillator_matrix_uses_a_dot_field_and_changes_with_wave_type() {
+        let ctx = egui::Context::default();
+        let draw = |wave| {
+            ctx.run(
+                egui::RawInput {
+                    time: Some(0.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        oscillator_matrix(
+                            ui,
+                            Rect::from_min_size(Pos2::new(10.0, 10.0), Vec2::new(500.0, 76.0)),
+                            wave,
+                        );
+                    });
+                },
+            )
+            .shapes
+            .into_iter()
+            .find_map(|shape| match shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.vertices.len() > 1000 => Some(mesh),
+                _ => None,
+            })
+            .expect("Wave must be drawn as a matrix of textured dots")
+        };
+        let sine = draw(0);
+        let square = draw(2);
+        assert_eq!(sine.vertices.len(), square.vertices.len());
+        assert!(sine
+            .vertices
+            .iter()
+            .zip(&square.vertices)
+            .any(|(a, b)| a.color != b.color));
     }
 }

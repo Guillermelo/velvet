@@ -22,6 +22,7 @@ fn cli_persists_commands_history_and_renders_without_ai() {
     let source = temp.path().join("external.wav");
     velvet_audio::export(
         &velvet_audio::Mix {
+            device_signals: Default::default(),
             sample_rate: 8000,
             frames: vec![[0.2; 2]; 8000],
             missing: vec![],

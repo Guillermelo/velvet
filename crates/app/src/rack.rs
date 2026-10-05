@@ -8,18 +8,26 @@ struct DeviceDrag {
 
 impl Velvet {
     pub(super) fn rack(&mut self, ctx: &egui::Context) {
-        let tall = self
+        let has_synth = self
             .selected_track
             .as_deref()
-            .and_then(|target| self.session.project.devices(target).ok())
-            .is_some_and(|devices| {
-                devices
-                    .iter()
-                    .any(|d| matches!(d.kind.as_str(), "builtin.eq8" | "builtin.compressor"))
-            });
+            .and_then(|id| self.session.project.track(id).ok())
+            .is_some_and(|t| t.synth.is_some());
+        let has_beat = self.selected_track.as_deref().and_then(|t| self.session.project.devices(t).ok()).is_some_and(|d| d.iter().any(|d| d.kind == "builtin.beat"));
+        let tall = has_beat || has_synth
+            || self
+                .selected_track
+                .as_deref()
+                .and_then(|target| self.session.project.devices(target).ok())
+                .is_some_and(|devices| {
+                    devices.iter().any(|d| {
+                        d.plugin_path().is_some()
+                            || matches!(d.kind.as_str(), "builtin.eq8" | "builtin.compressor")
+                    })
+                });
         egui::TopBottomPanel::bottom("rack")
-            .default_height(if tall { 238.0 } else { 180.0 })
-            .height_range(if tall { 220.0..=400.0 } else { 170.0..=400.0 })
+            .default_height(if has_beat { 374.0 } else if has_synth { 304.0 } else if tall { 238.0 } else { 180.0 })
+            .height_range(if has_beat { 360.0..=480.0 } else if has_synth { 290.0..=400.0 } else if tall { 220.0..=400.0 } else { 170.0..=400.0 })
             .resizable(true)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(6.0))
             .show(ctx, |ui| {
@@ -40,6 +48,9 @@ impl Velvet {
                     }) {
                         self.selected_device = None;
                     }
+                    let instrument = self.session.project.track(&target).ok()
+                        .filter(|t| matches!(t.kind, velvet_core::TrackKind::Midi))
+                        .map(|t| t.synth.clone());
                     let name = if target == "master" {
                         "Master"
                     } else {
@@ -48,7 +59,20 @@ impl Velvet {
                     ui.horizontal(|ui| {
                         eyebrow(ui, "DEVICE CHAIN");
                         ui.label(egui::RichText::new(format!("/ {name}")).color(MUTED));
+                        if let Some(instrument) = &instrument {
+                            ui.separator();
+                            ui.label(egui::RichText::new(format!("INSTRUMENT / {}", instrument.as_ref().map_or("None".into(), |d| d.display_name()))).small().color(CYAN));
+                            if ui.small_button("Choose instrument").clicked() {
+                                self.browser_category = 4;
+                            }
+                            if ui.small_button("Piano roll").on_hover_text("Edit MIDI notes · F7").clicked() {
+                                ctx.data_mut(|d|d.insert_temp(egui::Id::new("midi_edit_target"),target.clone()));
+                            }
+                        }
                     });
+                    if instrument.is_some() {
+                        self.instrument_drop(ui, ui.available_rect_before_wrap(), &target);
+                    }
                     let height =
                         (ui.available_height() - 14.0).max(if tall { 172.0 } else { 120.0 });
                     egui::ScrollArea::horizontal()
@@ -57,9 +81,39 @@ impl Velvet {
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.x = 7.0;
                             ui.horizontal_top(|ui| {
+                                if let Some(Some(synth)) = &instrument {
+                                    ui.push_id(("instrument_slot", &target), |ui| {
+                                        let (rect, _) = ui.allocate_exact_size(Vec2::new(520.0, height), Sense::hover());
+                                        ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(18, 20, 25));
+                                        ui.painter().rect_stroke(rect, 4.0, Stroke::new(0.5_f32, LINE), egui::StrokeKind::Inside);
+                                        let title = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 24.0));
+                                        ui.painter().rect_filled(title, 2.0, Color32::from_rgb(28, 31, 38));
+                                        ui.scope_builder(egui::UiBuilder::new().max_rect(title.shrink2(Vec2::new(5.0, 1.0)))
+                                            .layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                                            ui.painter().circle_filled(dot.center(), 4.0, ACCENT);
+                                            ui.label(egui::RichText::new(synth.display_name()).monospace().size(10.0));
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if ui.small_button("×").on_hover_text("Remove instrument; keep MIDI notes").clicked() {
+                                                    self.execute(Command::SetTrackInstrument { track_id: target.clone(), kind: None });
+                                                }
+                                                if ui.small_button("↗").on_hover_text("Pop out · Dot stays in the chain").clicked() {
+                                                    if synth.plugin_path().is_some() { self.open_plugin_editor(&target, synth); } else { self.synth_popout = Some((target.clone(), synth.id.clone())); }
+                                                }
+                                            });
+                                        });
+                                        let body = Rect::from_min_max(Pos2::new(rect.left() + 8.0, title.bottom() + 6.0), rect.max - Vec2::new(8.0, 6.0));
+                                        ui.scope_builder(egui::UiBuilder::new().max_rect(body)
+                                            .layout(egui::Layout::top_down(egui::Align::Center)), |ui| {
+                                            ui.set_clip_rect(body.intersect(ui.clip_rect()));
+                                            self.synth_controls(ui, &target, synth, true);
+                                        });
+                                    });
+                                }
                                 for (index, device) in devices.iter().enumerate() {
                                     ui.push_id(&device.id, |ui| {
                                         let width = match device.kind.as_str() {
+                                            "builtin.beat" => 850.0,
                                             "builtin.eq8" => 580.0,
                                             "builtin.gain" => 130.0,
                                             _ => 252.0,
@@ -135,13 +189,7 @@ impl Velvet {
                                                 );
                                                 ui.label(
                                                     egui::RichText::new(
-                                                        BUILTIN_DEVICES
-                                                            .iter()
-                                                            .find(|(_, kind, _)| {
-                                                                *kind == device.kind
-                                                            })
-                                                            .unwrap()
-                                                            .0,
+                                                        device.display_name(),
                                                     )
                                                     .monospace()
                                                     .size(10.0),
@@ -169,7 +217,9 @@ impl Velvet {
                                             Pos2::new(rect.left() + 8.0, title.bottom() + 6.0),
                                             rect.max - Vec2::new(8.0, 6.0),
                                         );
-                                        if device.kind == "builtin.eq8" {
+                                        if device.kind == "builtin.beat" {
+                                            self.beat_editor(ui, &target, device, body);
+                                        } else if device.kind == "builtin.eq8" {
                                             self.eq_editor(ui, &target, device, body);
                                         } else {
                                             self.device_controls(ui, &target, device, body);
@@ -229,6 +279,35 @@ impl Velvet {
         {
             return;
         }
+        if egui::DragAndDrop::payload::<crate::browser::EffectDrag>(ui.ctx()).is_some() {
+            ui.painter().line_segment(
+                [
+                    Pos2::new(x, response.rect.top()),
+                    Pos2::new(x, response.rect.bottom()),
+                ],
+                Stroke::new(2.0_f32, CYAN),
+            );
+            if ui.input(|i| i.pointer.any_released()) {
+                let payload =
+                    egui::DragAndDrop::take_payload::<crate::browser::EffectDrag>(ui.ctx())
+                        .unwrap();
+                self.execute(Command::AddDevice {
+                    track_id: target.into(),
+                    kind: payload.kind.clone(),
+                });
+                if let Ok(chain) = self.session.project.devices(target) {
+                    if let Some(device) = chain.last() {
+                        let id = device.id.clone();
+                        self.execute(Command::MoveDevice {
+                            track_id: target.into(),
+                            device_id: id,
+                            index: insertion,
+                        });
+                    }
+                }
+            }
+            return;
+        }
         let Some(payload) = egui::DragAndDrop::payload::<DeviceDrag>(ui.ctx()) else {
             return;
         };
@@ -263,6 +342,12 @@ impl Velvet {
         });
     }
     fn device_controls(&mut self, ui: &mut egui::Ui, target: &str, device: &Device, body: Rect) {
+        if device.plugin_path().is_some() {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                self.plugin_controls(ui, target, device)
+            });
+            return;
+        }
         let compact = device.kind == "builtin.compressor";
         let parameters: &[(&str, &str, &str)] = match device.kind.as_str() {
             "builtin.compressor" => &[
@@ -318,7 +403,7 @@ impl Velvet {
     }
 }
 
-fn parameter_knob(
+pub(super) fn parameter_knob(
     ui: &mut egui::Ui,
     device: &Device,
     parameter: &str,
@@ -677,6 +762,60 @@ impl Velvet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn library_effect_drop_inserts_at_requested_position() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Drop"), PathBuf::new());
+        app.job = None;
+        app.execute(Command::AddDevice {
+            track_id: "master".into(),
+            kind: "builtin.gain".into(),
+        });
+        let rect = Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::splat(100.0));
+        let point = rect.center();
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if !pressed {
+                            egui::DragAndDrop::set_payload(
+                                ctx,
+                                crate::browser::EffectDrag {
+                                    kind: "builtin.limiter".into(),
+                                },
+                            );
+                        }
+                        let response = ui.interact(rect, ui.id().with("drop"), Sense::hover());
+                        let devices = app.session.project.master_devices.clone();
+                        app.device_drop(ui, &response, "master", &devices, 0, rect.left());
+                    });
+                },
+            );
+        }
+        assert_eq!(
+            app.session
+                .project
+                .master_devices
+                .iter()
+                .map(|d| d.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["builtin.limiter", "builtin.gain"]
+        );
+    }
+
     #[test]
     fn effect_header_selects_highlights_reorders_both_directions_and_deletes() {
         let ctx = egui::Context::default();

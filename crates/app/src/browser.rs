@@ -1,9 +1,17 @@
 use super::*;
 
+pub(super) struct EffectDrag {
+    pub kind: String,
+}
+pub(super) struct SampleDrag {
+    pub path: PathBuf,
+}
+
 #[derive(Clone, Copy)]
 enum BrowserIcon {
     Folder,
     Audio,
+    Instrument,
     Effects,
     Project,
     All,
@@ -82,6 +90,50 @@ impl Velvet {
             self.session.transport.seconds * self.session.project.tempo.bpm / 60.0,
         );
     }
+    fn preview_sample(&mut self, path: PathBuf) {
+        self.sample_preview = None;
+        let (tx, rx) = mpsc::channel();
+        self.sample_preview_job = Some(rx);
+        std::thread::spawn(move || {
+            let result = (|| {
+                let rate = Player::output_rate()?;
+                let data = velvet_audio::decode(&path)?;
+                let ratio = data.sample_rate as f64 / rate as f64;
+                let count = (data.frames.len() as f64 / ratio).ceil() as usize;
+                let frames = (0..count).map(|i| {
+                    let position = i as f64 * ratio;
+                    let index = position as usize;
+                    let a = data.frames[index.min(data.frames.len() - 1)];
+                    let b = data.frames[(index + 1).min(data.frames.len() - 1)];
+                    let blend = position.fract() as f32;
+                    [a[0] + (b[0] - a[0]) * blend, a[1] + (b[1] - a[1]) * blend]
+                }).collect();
+                Ok(Mix { sample_rate: rate, frames, missing: vec![], sources: vec![path],
+                    peak: 0.0, device_signals: Default::default() })
+            })();
+            let _ = tx.send(result);
+        });
+    }
+    pub(super) fn poll_sample_preview(&mut self) {
+        if let Some(rx) = &self.sample_preview_job {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.sample_preview_job = None;
+                    match result.and_then(|mix| Player::new(Arc::new(mix), 0.0)) {
+                        Ok(player) => {
+                            player.set_monitor_gain(self.monitor_volume, false);
+                            player.play();
+                            self.sample_preview = Some(player);
+                        }
+                        Err(error) => self.report(Err(error), ""),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.sample_preview_job = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.sample_preview.as_ref().is_some_and(|p| !p.playing()) { self.sample_preview = None; }
+    }
     pub(super) fn browser(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("browser")
             .default_width(420.0)
@@ -135,6 +187,7 @@ impl Velvet {
                                     (0, "All"),
                                     (1, "Samples"),
                                     (2, "Audio Effects"),
+                                    (4, "Instruments"),
                                     (3, "Current Project"),
                                 ] {
                                     if ui
@@ -171,6 +224,7 @@ impl Velvet {
                                     for (category, label, icon) in [
                                         (0, "All", BrowserIcon::All),
                                         (2, "Audio Effects", BrowserIcon::Effects),
+                                        (4, "Instruments", BrowserIcon::Instrument),
                                         (1, "Samples", BrowserIcon::Audio),
                                         (3, "Clips", BrowserIcon::Project),
                                     ] {
@@ -212,6 +266,7 @@ impl Velvet {
                                             &name,
                                             BrowserIcon::Folder,
                                             self.browser_category != 2
+                                                && self.browser_category != 4
                                                 && self.browser_category != 3
                                                 && self.browser_folder.is_some(),
                                             0.0,
@@ -300,7 +355,7 @@ impl Velvet {
                     });
                 });
             });
-        if self.browser_category != 2 && self.browser_category != 3 {
+        if self.browser_category != 2 && self.browser_category != 3 && self.browser_category != 4 {
             if let Some(folder) = self.browser_folder.clone() {
                 ui.horizontal(|ui| {
                     if ui
@@ -329,6 +384,34 @@ impl Velvet {
                 });
             }
         }
+        if matches!(self.browser_category, 0 | 2 | 4) {
+            ui.menu_button("VST3", |ui| {
+                if ui.small_button("Refresh VST3").clicked() {
+                    self.plugin_paths = velvet_audio::plugins::scan();
+                    self.scan_plugin_roles();
+                }
+                if ui.small_button("Add VST3…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("VST3", &["vst3"])
+                        .pick_file()
+                    {
+                        if !self.plugin_paths.contains(&path) {
+                            self.plugin_paths.push(path);
+                            self.scan_plugin_roles();
+                        }
+                    }
+                }
+                if ui.small_button("VST3 folder…").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        self.plugin_paths
+                            .extend(velvet_audio::plugins::scan_folder(&folder));
+                        self.plugin_paths.sort();
+                        self.plugin_paths.dedup();
+                        self.scan_plugin_roles();
+                    }
+                }
+            });
+        }
         let query = self.search.trim().to_lowercase();
         let list_height = (height - 94.0).max(60.0);
         let mut count = 0;
@@ -354,10 +437,13 @@ impl Velvet {
                                     .as_deref()
                                     .is_some_and(|id| self.session.project.devices(id).is_ok()),
                             |ui| {
-                                if browser_row(ui, name, BrowserIcon::Effects, false, 0.0, None)
-                                    .on_hover_text(format!("{description}\nAdd to selected track"))
-                                    .clicked()
-                                {
+                                let response =
+                                    browser_row(ui, name, BrowserIcon::Effects, false, 0.0, None)
+                                        .on_hover_text(format!(
+                                        "{description}\nDrag into the device chain · Click to add"
+                                    ));
+                                response.dnd_set_drag_payload(EffectDrag { kind: kind.into() });
+                                if response.clicked() {
                                     self.execute(Command::AddDevice {
                                         track_id: self.selected_track.clone().unwrap(),
                                         kind: kind.into(),
@@ -367,7 +453,112 @@ impl Velvet {
                         );
                     }
                 }
-                if self.browser_category != 2 {
+                if (self.browser_category == 0 || self.browser_category == 4)
+                    && "dot native polyphonic synthesizer builtin.dot".contains(&query)
+                {
+                    count += 1;
+                    let target = self.selected_track.clone().filter(|id| {
+                        self.session
+                            .project
+                            .track(id)
+                            .is_ok_and(|t| matches!(t.kind, velvet_core::TrackKind::Midi))
+                    });
+                    ui.add_enabled_ui(self.job.is_none(), |ui| {
+                        let response = browser_row(
+                            ui,
+                            "Dot",
+                            BrowserIcon::Instrument,
+                            false,
+                            0.0,
+                            None,
+                        )
+                        .interact(Sense::click_and_drag())
+                        .on_hover_text(
+                            "Drag onto a MIDI track · Click to assign to selected MIDI track",
+                        );
+                        response.dnd_set_drag_payload(crate::synth::InstrumentDrag {
+                            kind: "builtin.dot".into(),
+                        });
+                        if response.clicked() {
+                            if let Some(track_id) = target {
+                                self.execute(Command::SetTrackInstrument {
+                                    track_id,
+                                    kind: Some("builtin.dot".into()),
+                                });
+                            } else {
+                                self.status = "Select a MIDI track or drag Dot onto one".into();
+                            }
+                        }
+                    });
+                    if self.browser_category == 4 {
+                        ui.label(
+                            egui::RichText::new("Drag Dot onto a MIDI track")
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
+                }
+                if matches!(self.browser_category, 0 | 2 | 4) {
+                    for path in self.plugin_paths.clone() {
+                        let name = path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        if !name.to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        let known_role = self.plugin_roles.get(&path).copied();
+                        if (self.browser_category == 4 && known_role == Some(false))
+                            || (self.browser_category == 2 && known_role == Some(true))
+                        {
+                            continue;
+                        }
+                        count += 1;
+                        let instrument = known_role.unwrap_or(self.browser_category == 4);
+                        let kind = format!(
+                            "vst3.{}:{}",
+                            if instrument { "instrument" } else { "effect" },
+                            path.display()
+                        );
+                        let response = browser_row(
+                            ui,
+                            &format!("{name} / VST3"),
+                            if instrument {
+                                BrowserIcon::Instrument
+                            } else {
+                                BrowserIcon::Effects
+                            },
+                            false,
+                            0.0,
+                            None,
+                        )
+                        .on_hover_text(format!(
+                            "{}\nUse Instruments for MIDI, Effects for audio",
+                            path.display()
+                        ));
+                        if instrument {
+                            response.dnd_set_drag_payload(crate::synth::InstrumentDrag {
+                                kind: kind.clone(),
+                            });
+                        } else {
+                            response.dnd_set_drag_payload(EffectDrag { kind: kind.clone() });
+                        }
+                        if response.clicked() && self.job.is_none() {
+                            if let Some(track_id) = self.selected_track.clone() {
+                                if instrument {
+                                    self.execute(Command::SetTrackInstrument {
+                                        track_id,
+                                        kind: Some(kind),
+                                    });
+                                } else {
+                                    self.execute(Command::AddDevice { track_id, kind });
+                                }
+                            }
+                        }
+                    }
+                }
+                if self.browser_category != 2 && self.browser_category != 4 {
                     let files = if self.browser_folder.is_some() && self.browser_category != 3 {
                         self.browser_files.clone()
                     } else {
@@ -412,9 +603,15 @@ impl Velvet {
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy());
         ui.add(
             egui::Label::new(
-                egui::RichText::new(selection.as_deref().unwrap_or("WAV / FLAC"))
-                    .small()
-                    .color(MUTED),
+                egui::RichText::new(selection.as_deref().unwrap_or(
+                    if self.browser_category == 4 {
+                        "VELVET / NATIVE INSTRUMENTS"
+                    } else {
+                        "WAV / FLAC"
+                    },
+                ))
+                .small()
+                .color(MUTED),
             )
             .truncate(),
         );
@@ -425,8 +622,10 @@ impl Velvet {
             ui.label(
                 egui::RichText::new(if selection.is_some() {
                     "1 item selected"
+                } else if self.browser_category == 4 {
+                    "Drag onto MIDI track · Click to assign"
                 } else {
-                    "Double-click to import"
+                    "Drag onto arrangement · Double-click to import"
                 })
                 .small()
                 .color(MUTED),
@@ -462,8 +661,12 @@ impl Velvet {
                 directory.then_some(expanded),
             )
             .on_hover_text(path.display().to_string());
+            if !directory && self.job.is_none() {
+                response.dnd_set_drag_payload(SampleDrag { path: path.clone() });
+            }
             if response.clicked() {
                 self.browser_selected = Some(path.clone());
+                if !directory { self.preview_sample(path.clone()); }
                 if directory
                     && response
                         .interact_pointer_pos()
@@ -531,8 +734,10 @@ fn browser_row(
     indent: f32,
     expanded: Option<bool>,
 ) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 21.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 21.0),
+        Sense::click_and_drag(),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -617,7 +822,7 @@ fn browser_icon(painter: &egui::Painter, rect: Rect, icon: BrowserIcon, color: C
                 stroke,
             );
         }
-        BrowserIcon::Audio => {
+        BrowserIcon::Audio | BrowserIcon::Instrument => {
             painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
             for (i, height) in [3.0, 7.0, 5.0, 2.0].into_iter().enumerate() {
                 let x = rect.left() + 3.0 + i as f32 * 2.0;
@@ -733,6 +938,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = Velvet::new(&ctx);
         app.job = None;
+        app.browser_history.clear();
+        app.browser_history_index = 0;
         app.session.transport.playing = true;
         app.session.transport.seconds = 4.0;
         assert!(app.browse_folder(dir.path().to_path_buf()));
@@ -777,6 +984,7 @@ mod tests {
         );
         let _ = ctx.run(input(vec![button(false)]), |ctx| app.browser(ctx));
         assert_eq!(app.browser_selected, Some(voice));
+        assert!(app.sample_preview_job.is_some(), "Single click must request a preview");
         assert!(app.session.transport.playing);
         assert_eq!(app.session.transport.seconds, 4.0);
         assert!(app.job.is_none(), "Single selection imported audio");

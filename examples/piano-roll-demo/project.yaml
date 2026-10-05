@@ -1,0 +1,561 @@
+format: 1
+project:
+  id: project_89d78b09ccce4bac8880aaa4f9d902c6
+  name: Glass notes
+audio:
+  sample_rate: 48000
+tempo:
+  bpm: 108.0
+master:
+  volume_db: 0.0
+  pan: 0.0
+  mute: false
+  solo: false
+tracks:
+- midi_region:
+    start_beats: 0.0
+    offset_beats: 0.0
+    length_beats: 16.0
+  synth:
+    id: device_4ef156f0e0294c75863ade8e8cd71916
+    type: builtin.dot
+    parameters:
+      attack_ms: 10.0
+      cutoff_freq_hz: 6000.0
+      decay_ms: 180.0
+      gain_db: -15.0
+      release_ms: 350.0
+      sustain: 0.65
+      wave_type: 0.0
+  notes:
+  - key: 60
+    velocity: 72
+    start_beats: 0.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 79
+    start_beats: 0.03
+    length_beats: 2.97
+    muted: false
+    channel: 1
+  - key: 67
+    velocity: 86
+    start_beats: 0.06
+    length_beats: 2.94
+    muted: false
+    channel: 1
+  - key: 71
+    velocity: 93
+    start_beats: 0.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 81
+    velocity: 98
+    start_beats: 0.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 79
+    velocity: 98
+    start_beats: 1.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 2.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 79
+    velocity: 98
+    start_beats: 3.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 57
+    velocity: 72
+    start_beats: 4.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 60
+    velocity: 79
+    start_beats: 4.03
+    length_beats: 2.97
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 86
+    start_beats: 4.06
+    length_beats: 2.94
+    muted: false
+    channel: 1
+  - key: 67
+    velocity: 93
+    start_beats: 4.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 77
+    velocity: 98
+    start_beats: 4.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 5.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 6.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 7.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 53
+    velocity: 72
+    start_beats: 8.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 57
+    velocity: 79
+    start_beats: 8.03
+    length_beats: 2.97
+    muted: false
+    channel: 1
+  - key: 60
+    velocity: 86
+    start_beats: 8.06
+    length_beats: 2.94
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 93
+    start_beats: 8.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 76
+    velocity: 98
+    start_beats: 8.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 9.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 69
+    velocity: 98
+    start_beats: 10.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 11.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 55
+    velocity: 72
+    start_beats: 12.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 59
+    velocity: 79
+    start_beats: 12.03
+    length_beats: 2.97
+    muted: false
+    channel: 1
+  - key: 62
+    velocity: 86
+    start_beats: 12.06
+    length_beats: 2.94
+    muted: false
+    channel: 1
+  - key: 66
+    velocity: 93
+    start_beats: 12.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 69
+    velocity: 98
+    start_beats: 12.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 74
+    velocity: 98
+    start_beats: 13.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 71
+    velocity: 98
+    start_beats: 14.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 74
+    velocity: 98
+    start_beats: 15.5
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  id: track_a6ba83738bcd4c56adb2861455b56ec6
+  name: Glass keys
+  type: midi
+  color:
+  - 160
+  - 214
+  - 230
+  mixer:
+    volume_db: 0.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips: []
+  devices: []
+- midi_region:
+    start_beats: 0.0
+    offset_beats: 0.0
+    length_beats: 16.0
+  synth:
+    id: device_5b29a8059cf64d1d96c10343293a1472
+    type: builtin.dot
+    parameters:
+      attack_ms: 10.0
+      cutoff_freq_hz: 6000.0
+      decay_ms: 180.0
+      gain_db: -15.0
+      release_ms: 350.0
+      sustain: 0.65
+      wave_type: 0.0
+  notes:
+  - key: 60
+    velocity: 72
+    start_beats: 0.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 79
+    start_beats: 0.03
+    length_beats: 2.97
+    muted: false
+    channel: 1
+  - key: 67
+    velocity: 86
+    start_beats: 0.06
+    length_beats: 2.94
+    muted: false
+    channel: 1
+  - key: 71
+    velocity: 93
+    start_beats: 0.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 83
+    velocity: 98
+    start_beats: 0.0
+    length_beats: 0.4
+    muted: false
+    channel: 2
+  - key: 79
+    velocity: 98
+    start_beats: 1.0
+    length_beats: 0.3999999999999999
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 2.5
+    length_beats: 0.3999999999999999
+    muted: false
+    channel: 2
+  - key: 79
+    velocity: 98
+    start_beats: 3.5
+    length_beats: 0.3999999999999999
+    muted: false
+    channel: 2
+  - key: 57
+    velocity: 72
+    start_beats: 4.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 60
+    velocity: 79
+    start_beats: 4.03
+    length_beats: 2.9699999999999998
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 86
+    start_beats: 4.06
+    length_beats: 2.9400000000000004
+    muted: false
+    channel: 1
+  - key: 67
+    velocity: 93
+    start_beats: 4.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 79
+    velocity: 98
+    start_beats: 4.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 5.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 6.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 76
+    velocity: 98
+    start_beats: 7.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 53
+    velocity: 72
+    start_beats: 8.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 57
+    velocity: 79
+    start_beats: 8.03
+    length_beats: 2.9700000000000006
+    muted: false
+    channel: 1
+  - key: 60
+    velocity: 86
+    start_beats: 8.06
+    length_beats: 2.9399999999999995
+    muted: false
+    channel: 1
+  - key: 64
+    velocity: 93
+    start_beats: 8.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 76
+    velocity: 98
+    start_beats: 8.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 9.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 69
+    velocity: 98
+    start_beats: 10.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 72
+    velocity: 98
+    start_beats: 11.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 55
+    velocity: 72
+    start_beats: 12.0
+    length_beats: 3.0
+    muted: false
+    channel: 1
+  - key: 59
+    velocity: 79
+    start_beats: 12.03
+    length_beats: 2.9700000000000006
+    muted: false
+    channel: 1
+  - key: 62
+    velocity: 86
+    start_beats: 12.06
+    length_beats: 2.9399999999999995
+    muted: false
+    channel: 1
+  - key: 65
+    velocity: 93
+    start_beats: 12.09
+    length_beats: 2.91
+    muted: false
+    channel: 1
+  - key: 77
+    velocity: 98
+    start_beats: 12.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 74
+    velocity: 98
+    start_beats: 13.0
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 71
+    velocity: 98
+    start_beats: 14.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  - key: 74
+    velocity: 98
+    start_beats: 15.5
+    length_beats: 0.40000000000000036
+    muted: false
+    channel: 2
+  id: track_bee6b3b7c7414024af6550ee14cab4f4
+  name: Glass keys · copy
+  type: midi
+  color:
+  - 160
+  - 214
+  - 230
+  mixer:
+    volume_db: -10.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips: []
+  devices:
+  - id: device_5e6420df727d4edba7fd32cd33e0a5a5
+    type: builtin.beat
+    parameters:
+      attack_ms: 1.0
+      bypass_enabled: 0.0
+      hold_enabled: 0.0
+      link_enabled: 0.0
+      loop_beats: 4.0
+      mix: 1.0
+      offset_beats: 0.0
+      release_ms: 10.0
+      smooth_ms: 2.0
+      tension: 0.0
+      time_mix: 1.0
+      time_slot: 21.0
+      volume_mix: 1.0
+      volume_slot: 0.0
+  - id: device_8ad614255d0d43e89201f415a10a25b1
+    type: vst3.effect:C:\Program Files\Common Files\VST3\ValhallaDSP\ValhallaShimmer.vst3
+    parameters: {}
+- midi_region:
+    start_beats: 0.0
+    offset_beats: 0.0
+    length_beats: 16.0
+  synth:
+    id: device_6ce61e47a7eb402baceb9e5fe29a9f4a
+    type: builtin.dot
+    parameters:
+      attack_ms: 10.0
+      cutoff_freq_hz: 6000.0
+      decay_ms: 180.0
+      gain_db: -15.0
+      release_ms: 350.0
+      sustain: 0.65
+      wave_type: 0.0
+  notes:
+  - key: 48
+    velocity: 90
+    start_beats: 0.0
+    length_beats: 3.5
+    muted: false
+    channel: 1
+  - key: 45
+    velocity: 90
+    start_beats: 4.0
+    length_beats: 3.5
+    muted: false
+    channel: 1
+  - key: 41
+    velocity: 90
+    start_beats: 8.0
+    length_beats: 3.5
+    muted: false
+    channel: 1
+  - key: 43
+    velocity: 90
+    start_beats: 12.0
+    length_beats: 3.5
+    muted: false
+    channel: 1
+  id: track_64ca243f8bbd48ef8d589632627edb9d
+  name: Low tide
+  type: midi
+  color:
+  - 160
+  - 214
+  - 230
+  mixer:
+    volume_db: 0.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips: []
+  devices: []
+- id: track_8747b74f73bc4690834e961b206c11e9
+  name: DC - WhiteNoiz TransFX
+  type: audio
+  color:
+  - 120
+  - 157
+  - 156
+  mixer:
+    volume_db: -10.0
+    pan: 0.0
+    mute: false
+    solo: false
+  clips:
+  - id: clip_568c079b632f44d1b65577a7ba4edee4
+    source:
+      path: media\edit_08b42c5e9a1144f382dd1a011e1d9176.wav
+      kind: project
+    position:
+      start_beats: 6.5
+      offset_seconds: 8.75
+      length_seconds: 5.249999999999999
+    source_bpm: 108.0
+  devices:
+  - id: device_3b7d72804881420a938c9664474510c2
+    type: vst3.effect:C:\Program Files\Common Files\VST3\ValhallaDSP\ValhallaFreqEcho.vst3
+    parameters: {}
+  - id: device_8f8890bfacd84e0297c0c633c22ffefb
+    type: vst3.effect:C:\Program Files\Common Files\VST3\ValhallaDSP\ValhallaPlate.vst3
+    parameters: {}

@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 const CYAN: Color32 = Color32::from_rgb(56, 189, 248);
 const ROSE: Color32 = Color32::from_rgb(243, 134, 161);
 #[path = "../src/matrix.rs"]
+#[allow(dead_code)] // The profiling example uses only the arrangement matrix.
 mod matrix;
 
 fn main() {

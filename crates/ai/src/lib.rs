@@ -103,6 +103,20 @@ fn boolean(args: &Value, name: &str) -> Result<bool> {
         .as_bool()
         .with_context(|| format!("Missing {name}"))
 }
+// Opaque plugin state can contain sample data; it must stay local.
+fn project_metadata(project: &velvet_core::Project) -> velvet_core::Project {
+    let mut metadata = project.clone();
+    for device in metadata
+        .tracks
+        .iter_mut()
+        .flat_map(|t| t.devices.iter_mut().chain(t.synth.iter_mut()))
+        .chain(&mut metadata.master_devices)
+    {
+        device.plugin_state.clear();
+    }
+    metadata
+}
+
 pub fn execute_tool(
     s: &mut Session,
     name: &str,
@@ -111,17 +125,17 @@ pub fn execute_tool(
 ) -> Result<Value> {
     if name == "project_inspect" {
         return Ok(
-            json!({"project":s.project,"transport":s.transport,"missing":s.project.missing(&s.root)}),
+            json!({"project":project_metadata(&s.project),"transport":s.transport,"missing":s.project.missing(&s.root)}),
         );
     }
     if name == "track_list" {
-        return Ok(json!(s.project.tracks));
+        return Ok(json!(project_metadata(&s.project).tracks));
     }
     if ["clip_list", "device_list", "device_get_parameters"].contains(&name) {
         let target = str_arg(&a, "track_id")?;
         return match name {
             "clip_list" => Ok(json!(s.project.track(&target)?.clips)),
-            "device_list" => Ok(json!(s.project.devices(&target)?)),
+            "device_list" => Ok(json!(project_metadata(&s.project).devices(&target)?)),
             _ => Ok(json!(
                 s.project
                     .devices(&target)?
@@ -266,7 +280,7 @@ pub fn tools() -> Vec<Value> {
         ),
         (
             "device_add",
-            "Append builtin.gain, builtin.eq, builtin.eq8, builtin.compressor or builtin.limiter; track_id can be 'master'",
+            "Append builtin.beat (tempo-synced time/volume, slots 0-35), builtin.gain, builtin.eq, builtin.eq8, builtin.compressor or builtin.limiter; track_id can be 'master'",
             &[("track_id", "string"), ("kind", "string")],
         ),
         (
@@ -366,5 +380,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parameters["ceiling_db"], -6.0);
+    }
+}
+
+#[cfg(test)]
+mod plugin_privacy_tests {
+    use super::*;
+    #[test]
+    fn ai_inspection_omits_opaque_plugin_state_without_changing_project() {
+        let root = std::env::current_dir().unwrap();
+        let mut session = Session::new(velvet_core::Project::new("Plugins"), root.clone());
+        session
+            .execute(Command::AddMidiTrack {
+                name: "MIDI".into(),
+            })
+            .unwrap();
+        let track = session.project.tracks[0].id.clone();
+        let path = root.join("Test.vst3");
+        session
+            .execute(Command::SetTrackInstrument {
+                track_id: track,
+                kind: Some(format!("vst3.instrument:{}", path.display())),
+            })
+            .unwrap();
+        session
+            .execute(Command::AddDevice {
+                track_id: "master".into(),
+                kind: format!("vst3.effect:{}", path.display()),
+            })
+            .unwrap();
+        session.project.tracks[0]
+            .synth
+            .as_mut()
+            .unwrap()
+            .plugin_state = vec![99, 255];
+        session.project.master_devices[0].plugin_state = vec![33, 55];
+        let before = session.project.clone();
+        for (name, args) in [
+            ("project_inspect", json!({})),
+            ("track_list", json!({})),
+            ("device_list", json!({"track_id":"master"})),
+        ] {
+            let output = execute_tool(&mut session, name, args, &mut vec![]).unwrap();
+            assert!(!output.to_string().contains("plugin_state"));
+        }
+        assert_eq!(session.project, before);
     }
 }

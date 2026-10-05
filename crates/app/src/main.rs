@@ -9,9 +9,14 @@ use std::{
 };
 use velvet_audio::{AudioData, MediaCache, Mix, Player};
 use velvet_core::{Command, Effect, Position, Project, Session, Source, SourceKind};
+mod arrangement_edit;
+mod beat;
 mod browser;
 mod matrix;
+mod piano_roll;
+mod plugins;
 mod rack;
+mod synth;
 mod theme;
 
 use theme::{ACCENT, BG, CYAN, LINE, MUTED, PANEL, ROSE, TEXT};
@@ -23,7 +28,7 @@ enum Job {
         beats: f64,
         data: anyhow::Result<Arc<AudioData>>,
     },
-    Mix(anyhow::Result<Mix>),
+    Mix(u64, anyhow::Result<Mix>),
     Export(anyhow::Result<PathBuf>),
     Ai {
         session: Box<Session>,
@@ -38,14 +43,30 @@ struct Drag {
     mode: u8,
     origin: Pos2,
 }
+type RenderTask = Box<dyn FnOnce(&mut velvet_audio::LiveMixer) + Send>;
+
 struct Velvet {
     session: Session,
     saved: Project,
     selected_track: Option<String>,
     selected_clip: Option<String>,
+    clip_clipboard: Option<arrangement_edit::ClipCopy>,
     selected_device: Option<(String, String)>,
+    synth_popout: Option<(String, String)>,
+    piano_roll: piano_roll::PianoRoll,
+    note_preview: Option<Player>,
+    note_preview_job: Option<Receiver<anyhow::Result<Mix>>>,
+    plugin_paths: Vec<PathBuf>,
+    plugin_roles: std::collections::BTreeMap<PathBuf, bool>,
+    plugin_scan: Option<Receiver<(PathBuf, bool)>>,
+    plugin_editor: Option<plugins::Editor>,
+    scope_enabled: std::collections::HashSet<String>,
+    scope_signals: std::collections::HashMap<String, Arc<velvet_audio::ScopeSignal>>,
     loop_clip: Option<(String, String)>,
     metronome: bool,
+    monitor_volume: f64,
+    sample_preview: Option<Player>,
+    sample_preview_job: Option<Receiver<anyhow::Result<Mix>>>,
     cache: MediaCache,
     player: Option<Player>,
     job: Option<Receiver<Job>>,
@@ -64,6 +85,8 @@ struct Velvet {
     capture_requested: bool,
     gesture: Option<(Project, u64)>,
     live_job: Option<Receiver<(u64, anyhow::Result<Mix>)>>,
+    render_worker: Option<mpsc::Sender<RenderTask>>,
+    render_generation: Arc<std::sync::atomic::AtomicU64>,
     live_dirty: bool,
     edit_time: Instant,
     timeline_scroll: f32,
@@ -84,7 +107,48 @@ struct Velvet {
     matrix: matrix::ParticleMatrix,
     matrix_enabled: bool,
 }
+fn track_toggle(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    color: Color32,
+    name: &str,
+) -> egui::Response {
+    let mut button = egui::Button::new(egui::RichText::new(label).strong().color(if active {
+        BG
+    } else {
+        MUTED
+    }))
+    .min_size(Vec2::new(24.0, 22.0))
+    .selected(active);
+    if active {
+        button = button.fill(color).stroke(Stroke::new(1.5_f32, color));
+    } else {
+        button = button.fill(BG).stroke(Stroke::new(1.0_f32, LINE));
+    }
+    ui.add(button)
+        .on_hover_text(format!("{name}: {}", if active { "ON" } else { "OFF" }))
+}
 fn main() -> eframe::Result<()> {
+    let _plugin_ui_thread = velvet_audio::plugins::initialize_ui_thread()
+        .map_err(|error| eframe::Error::AppCreation(error.into()))?;
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--velvet-plugin-info")) {
+        let result = std::env::args_os()
+            .nth(2)
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("Missing plugin path"))
+            .and_then(|path| velvet_audio::plugins::is_instrument(&path));
+        match result {
+            Ok(instrument) => {
+                println!("VELVET_PLUGIN_ROLE={instrument}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
@@ -124,9 +188,23 @@ impl Velvet {
             session,
             selected_track,
             selected_clip: None,
+            clip_clipboard: None,
             selected_device: None,
+            synth_popout: None,
+            piano_roll: piano_roll::PianoRoll::default(),
+            note_preview: None,
+            note_preview_job: None,
+            plugin_paths: velvet_audio::plugins::scan(),
+            plugin_roles: std::collections::BTreeMap::new(),
+            plugin_scan: None,
+            plugin_editor: None,
+            scope_enabled: Default::default(),
+            scope_signals: Default::default(),
             loop_clip: None,
             metronome: false,
+            monitor_volume: 1.0,
+            sample_preview: None,
+            sample_preview_job: None,
             cache: MediaCache::default(),
             player: None,
             job: None,
@@ -145,6 +223,8 @@ impl Velvet {
             capture_requested: false,
             gesture: None,
             live_job: None,
+            render_worker: None,
+            render_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             live_dirty: false,
             edit_time: Instant::now(),
             timeline_scroll: 0.0,
@@ -166,6 +246,7 @@ impl Velvet {
             matrix_enabled: true,
         };
         app.restore_samples_folder();
+        app.scan_plugin_roles();
         if !app.session.project.tracks.is_empty() {
             app.warm();
         }
@@ -184,6 +265,14 @@ impl Velvet {
         }
     }
     fn execute(&mut self, command: Command) {
+        let previous_bpm = self.session.project.tempo.bpm;
+        let selected_index = self
+            .session
+            .project
+            .tracks
+            .iter()
+            .position(|t| Some(&t.id) == self.selected_track.as_ref())
+            .unwrap_or(0);
         let revision = self.session.revision;
         let seek = match &command {
             Command::Seek { seconds } => Some(*seconds),
@@ -206,6 +295,7 @@ impl Velvet {
             Ok(Effect::None) => {
                 if self.session.revision != revision {
                     self.invalidate();
+                    self.synchronize_tempo(previous_bpm);
                     self.status = "Edit applied · Undo available".into();
                     self.error = false;
                 }
@@ -215,12 +305,36 @@ impl Velvet {
                 self.error = true;
             }
         }
+        self.ensure_track_selection(selected_index);
+    }
+    fn ensure_track_selection(&mut self, previous_index: usize) {
+        if self.selected_track.as_deref() == Some("master")
+            || self
+                .session
+                .project
+                .tracks
+                .iter()
+                .any(|t| Some(&t.id) == self.selected_track.as_ref())
+        {
+            return;
+        }
+        let tracks = &self.session.project.tracks;
+        self.selected_track = tracks
+            .get(previous_index.min(tracks.len().saturating_sub(1)))
+            .map(|t| t.id.clone());
+        self.selected_clip = None;
+        self.selected_device = None;
     }
     fn invalidate(&mut self) {
-        self.live_dirty = self.player.is_some();
-        self.edit_time = Instant::now();
+        self.render_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if !self.live_dirty {
+            self.edit_time = Instant::now();
+        }
+        self.live_dirty =
+            self.player.is_some() || self.job.is_some() || !self.scope_enabled.is_empty();
     }
     fn reset_playback(&mut self) {
+        self.render_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.player = None;
         self.live_job = None;
         self.live_dirty = false;
@@ -236,7 +350,10 @@ impl Velvet {
                     self.live_job = None;
                     if revision == self.session.revision {
                         match result {
-                            Ok(mix) => {
+                            Ok(mut mix) => {
+                                self.scope_signals = std::mem::take(&mut mix.device_signals);
+                                self.scope_signals
+                                    .retain(|id, _| self.scope_enabled.contains(id));
                                 if let Some(p) = &mut self.player {
                                     if let Err(e) = p.replace_mix(Arc::new(mix)) {
                                         self.report(Err(e), "");
@@ -260,39 +377,51 @@ impl Velvet {
             }
         }
         if self.live_dirty
+            && self.job.is_none()
+            && (self.player.is_some() || !self.scope_enabled.is_empty())
             && self.live_job.is_none()
             && self.edit_time.elapsed() >= Duration::from_millis(30)
         {
-            if let Some(player) = &self.player {
-                let rate = player.sample_rate;
-                let revision = self.session.revision;
-                let project = self.session.project.clone();
-                let root = self.session.root.clone();
-                let mut cache = MediaCache {
-                    files: self.cache.files.clone(),
-                };
-                let (tx, rx) = mpsc::channel();
-                self.live_job = Some(rx);
-                self.live_dirty = false;
-                // ponytail: whole-mix rebuild; use incremental track buses
-                // when larger projects make edit latency noticeable.
-                std::thread::spawn(move || {
-                    let _ = tx.send((
-                        revision,
-                        velvet_audio::mix(&project, &root, rate, &mut cache),
-                    ));
-                });
-            }
+            let rate = self
+                .player
+                .as_ref()
+                .map_or(self.session.project.audio.sample_rate, |p| p.sample_rate);
+            let scopes = self.scope_enabled.clone();
+            let revision = self.session.revision;
+            let project = self.session.project.clone();
+            let root = self.session.root.clone();
+            let mut cache = MediaCache {
+                files: self.cache.files.clone(),
+            };
+            let (tx, rx) = mpsc::channel();
+            self.live_job = Some(rx);
+            self.live_dirty = false;
+            self.render(move |renderer| {
+                let _ = tx.send((
+                    revision,
+                    renderer.mix(&project, &root, rate, &mut cache, &scopes),
+                ));
+            });
         }
     }
     fn history(&mut self, redo: bool) {
+        let previous_bpm = self.session.project.tempo.bpm;
+        let selected_index = self
+            .session
+            .project
+            .tracks
+            .iter()
+            .position(|t| Some(&t.id) == self.selected_track.as_ref())
+            .unwrap_or(0);
         let changed = if redo {
             self.session.redo()
         } else {
             self.session.undo()
         };
         if changed {
+            self.ensure_track_selection(selected_index);
             self.invalidate();
+            self.synchronize_tempo(previous_bpm);
             self.status = if redo { "Edit restored" } else { "Edit undone" }.into();
         }
     }
@@ -309,6 +438,23 @@ impl Velvet {
             p.seek(self.session.transport.seconds);
         }
     }
+    fn synchronize_tempo(&mut self, previous_bpm: f64) {
+        let bpm = self.session.project.tempo.bpm;
+        if bpm == previous_bpm {
+            return;
+        }
+        // The old rendered MIDI uses the old tempo. Never play it under the new grid.
+        if let Some(player) = &self.player {
+            player.pause();
+            self.session.transport.seconds = player.seconds();
+        }
+        self.session.transport.seconds *= previous_bpm / bpm;
+        self.player = None;
+        self.live_job = None;
+        if self.session.transport.playing && self.job.is_none() {
+            self.prepare_audio();
+        }
+    }
     fn prepare_audio(&mut self) {
         let rate = match Player::output_rate() {
             Ok(r) => r,
@@ -323,14 +469,23 @@ impl Velvet {
         let root = self.session.root.clone();
         let mut cache = MediaCache::default();
         cache.files = self.cache.files.clone();
-        self.start("Preparing audio", move || {
-            Job::Mix(velvet_audio::mix(&project, &root, rate, &mut cache))
+        let scopes = self.scope_enabled.clone();
+        let revision = self.session.revision;
+        let (tx, rx) = mpsc::channel();
+        self.job = Some(rx);
+        self.busy = "Preparing audio".into();
+        self.render(move |renderer| {
+            let _ = tx.send(Job::Mix(
+                revision,
+                renderer.mix(&project, &root, rate, &mut cache, &scopes),
+            ));
         });
     }
     fn toggle_metronome(&mut self) {
         self.metronome = !self.metronome;
         if let Some(player) = &self.player {
             player.set_metronome(self.metronome.then_some(self.session.project.tempo.bpm));
+            player.set_monitor_gain(self.monitor_volume, true);
         }
     }
     fn toggle_playback(&mut self) {
@@ -349,20 +504,32 @@ impl Velvet {
         }
     }
     fn loop_range(&self) -> Option<(f64, f64)> {
+        if let Some((a, b)) = self.piano_roll.loop_beats(&self.session.project) {
+            let seconds = 60.0 / self.session.project.tempo.bpm;
+            return (b > a).then_some((a * seconds, b * seconds));
+        }
         let (track, clip) = self.loop_clip.as_ref()?;
-        let position = &self
+        if track == clip {
+            let (start, end) = synth::midi_region(self.session.project.track(track).ok()?)?;
+            let seconds = 60.0 / self.session.project.tempo.bpm;
+            return Some((start * seconds, end * seconds));
+        }
+        let clip = self
             .session
             .project
             .track(track)
             .ok()?
             .clips
             .iter()
-            .find(|c| c.id == *clip)?
-            .position;
-        let start = position.start_beats * 60.0 / self.session.project.tempo.bpm;
-        Some((start, start + position.length_seconds))
+            .find(|c| c.id == *clip)?;
+        let start = clip.position.start_beats * 60.0 / self.session.project.tempo.bpm;
+        Some((
+            start,
+            start + clip.duration_seconds(self.session.project.tempo.bpm),
+        ))
     }
     fn toggle_clip_loop(&mut self) {
+        self.piano_roll.loop_enabled = false;
         if let (Some(track), Some(clip)) = (&self.selected_track, &self.selected_clip) {
             let selected = (track.clone(), clip.clone());
             self.loop_clip = if self.loop_clip.as_ref() == Some(&selected) {
@@ -394,14 +561,57 @@ impl Velvet {
         if let (Some(track_id), Some(clip_id)) =
             (self.selected_track.clone(), self.selected_clip.take())
         {
-            self.execute(Command::RemoveClip { track_id, clip_id });
+            if track_id == clip_id
+                && self
+                    .session
+                    .project
+                    .track(&track_id)
+                    .is_ok_and(|t| matches!(t.kind, velvet_core::TrackKind::Midi))
+            {
+                self.execute(Command::SetMidiNotes {
+                    track_id,
+                    notes: Vec::new(),
+                });
+            } else {
+                self.execute(Command::RemoveClip { track_id, clip_id });
+            }
+        } else if let Some(track_id) = self.selected_track.clone() {
+            if self.session.project.tracks.iter().any(|t| t.id == track_id) {
+                self.execute(Command::RemoveTrack { track_id });
+            }
         }
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.toggle_playback();
         }
+        if self.job.is_none() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
+                if self.piano_roll.open {
+                    self.piano_roll.open = false;
+                    self.piano_roll.keyboard_focus = false;
+                } else if self.selected_track.as_ref().is_some_and(|id| {
+                    self.session.project.track(id)
+                        .is_ok_and(|t| matches!(t.kind, velvet_core::TrackKind::Midi))
+                }) {
+                    self.piano_roll.open = true;
+                    self.piano_roll.keyboard_focus = true;
+                }
+            }
+        }
         if self.job.is_none() && !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::F7)) {
+                if let Some(target) = self.selected_track.as_ref().filter(|id| {
+                    self.session
+                        .project
+                        .track(id)
+                        .is_ok_and(|t| matches!(t.kind, velvet_core::TrackKind::Midi))
+                }) {
+                    ctx.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("midi_edit_target"), target.clone())
+                    });
+                }
+            }
             let (undo, redo, save, open, new, delete, loop_clip) = ctx.input(|i| {
                 (
                     i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
@@ -413,6 +623,9 @@ impl Velvet {
                     i.modifiers.ctrl && i.key_pressed(egui::Key::L),
                 )
             });
+            if !self.piano_roll.keyboard_focus {
+                self.arrangement_shortcuts(ctx);
+            }
             if undo {
                 self.history(false);
             }
@@ -430,10 +643,10 @@ impl Velvet {
             if new {
                 self.request_open(None);
             }
-            if loop_clip {
+            if loop_clip && !self.piano_roll.keyboard_focus {
                 self.toggle_clip_loop();
             }
-            if delete {
+            if delete && !self.piano_roll.keyboard_focus {
                 self.remove_selection();
             }
         }
@@ -532,6 +745,35 @@ impl Velvet {
             let _ = tx.send(work());
         });
     }
+
+    fn render(&mut self, work: impl FnOnce(&mut velvet_audio::LiveMixer) + Send + 'static) {
+        let generation = self.render_generation.clone();
+        let expected = generation.load(std::sync::atomic::Ordering::Acquire);
+        let mut task: RenderTask = Box::new(move |renderer| {
+            renderer.set_cancellation(generation, expected);
+            work(renderer);
+        });
+        loop {
+            let sender = self.render_worker.get_or_insert_with(|| {
+                let (tx, rx) = mpsc::channel::<RenderTask>();
+                std::thread::spawn(move || {
+                    let _ui = velvet_audio::plugins::initialize_ui_thread().ok();
+                    let mut renderer = velvet_audio::LiveMixer::default();
+                    while let Ok(task) = rx.recv() {
+                        task(&mut renderer);
+                    }
+                });
+                tx
+            });
+            match sender.send(task) {
+                Ok(()) => break,
+                Err(error) => {
+                    task = error.0;
+                    self.render_worker = None;
+                }
+            }
+        }
+    }
     fn warm(&mut self) {
         let project = self.session.project.clone();
         let root = self.session.root.clone();
@@ -565,6 +807,10 @@ impl Velvet {
         self.job = None;
         self.busy.clear();
         let preload_audio = matches!(&job, Job::Warm(Ok(_)) | Job::Import { data: Ok(_), .. });
+        if matches!(&job, Job::Mix(revision, _) if *revision != self.session.revision) {
+            self.prepare_audio();
+            return;
+        }
         match job {
             Job::Warm(r) => match r {
                 Ok(cache) => self.cache = cache,
@@ -599,10 +845,18 @@ impl Velvet {
                         .track(&track)
                         .ok()
                         .and_then(|t| t.clips.last().map(|c| c.id.clone()));
+                    if let Some(clip_id) = self.selected_clip.clone() {
+                        self.execute(Command::SetClipTempo {
+                            track_id: track,
+                            clip_id,
+                            source_bpm: Some(self.session.project.tempo.bpm),
+                        });
+                    }
                 }
                 Err(e) => self.report(Err(e), ""),
             },
-            Job::Mix(r) => match r.and_then(|m| {
+            Job::Mix(_, r) => match r.and_then(|mut m| {
+                self.scope_signals = std::mem::take(&mut m.device_signals);
                 if !m.missing.is_empty() {
                     self.status = format!("{} missing source(s) are silent", m.missing.len());
                 }
@@ -615,6 +869,7 @@ impl Velvet {
                         p.play();
                     }
                     self.player = Some(p);
+                    self.live_dirty = false;
                 }
                 Err(e) => {
                     self.session.transport.playing = false;
@@ -630,6 +885,7 @@ impl Velvet {
                 Err(e) => self.report(Err(e), ""),
             },
             Job::Ai { session, result } => {
+                let previous_bpm = self.session.project.tempo.bpm;
                 let changed = session.project != self.session.project;
                 let runtime = self
                     .player
@@ -649,6 +905,12 @@ impl Velvet {
                 }
                 if changed {
                     self.invalidate();
+                    if !transport_requested {
+                        self.synchronize_tempo(previous_bpm);
+                    } else if previous_bpm != self.session.project.tempo.bpm {
+                        self.player = None;
+                        self.live_job = None;
+                    }
                 }
                 match result {
                     Ok(a) => {
@@ -710,6 +972,9 @@ impl Velvet {
         });
     }
     fn export(&mut self, path: PathBuf) {
+        if !self.capture_plugin_state() {
+            return;
+        }
         let project = self.session.project.clone();
         let root = self.session.root.clone();
         let mut cache = MediaCache::default();
@@ -723,6 +988,9 @@ impl Velvet {
         });
     }
     fn save(&mut self, choose: bool) {
+        if !self.capture_plugin_state() {
+            return;
+        }
         if choose
             || self.session.root.as_os_str().is_empty()
             || !self.session.root.join("project.yaml").exists()
@@ -767,6 +1035,9 @@ impl Velvet {
         }
     }
     fn request_open(&mut self, path: Option<PathBuf>) {
+        if !self.capture_plugin_state() {
+            return;
+        }
         if self.session.project != self.saved {
             self.pending_new = Some(path);
         } else {
@@ -780,11 +1051,18 @@ impl Velvet {
         };
         match result {
             Ok(s) => {
+                self.piano_roll = piano_roll::PianoRoll::default();
+                self.note_preview = None;
+                self.note_preview_job = None;
+                self.plugin_editor = None;
+                self.scope_enabled.clear();
+                self.scope_signals.clear();
                 self.reset_playback();
                 self.session = s;
                 self.saved = self.session.project.clone();
                 self.selected_track = self.session.project.tracks.first().map(|t| t.id.clone());
                 self.selected_clip = None;
+                self.clip_clipboard = None;
                 self.selected_device = None;
                 self.loop_clip = None;
                 self.metronome = false;
@@ -1035,6 +1313,15 @@ impl Velvet {
                             length_seconds: length,
                         });
                     }
+                    let mut synced = c.source_bpm.is_some();
+                    let mut source_bpm = c.source_bpm.unwrap_or(self.session.project.tempo.bpm);
+                    let sync_changed = ui.checkbox(&mut synced, "Sync to BPM").changed();
+                    let bpm_changed = ui.add_enabled(synced,
+                        egui::DragValue::new(&mut source_bpm).range(20.0..=400.0).speed(0.1).prefix("Source BPM ")
+                    ).on_hover_text("Original audio tempo. Playback speed and pitch follow the project BPM.").changed();
+                    if sync_changed || bpm_changed {
+                        self.execute(Command::SetClipTempo { track_id: tid.clone(), clip_id: cid.clone(), source_bpm: synced.then_some(source_bpm) });
+                    }
                     let missing = !self
                         .session
                         .project
@@ -1085,6 +1372,54 @@ impl Velvet {
             }
         }
     }
+    fn track_name_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        track: &velvet_core::Track,
+        selected: bool,
+        color: Color32,
+    ) -> egui::Response {
+        let key = egui::Id::new(("track_name_edit", &track.id));
+        let draft = ui.data_mut(|d| d.get_temp::<(String, bool)>(key));
+        if let Some((mut name, first_frame)) = draft {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .id(key)
+                    .desired_width(ui.available_width()),
+            );
+            if first_frame {
+                response.request_focus();
+            }
+            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let commit = !first_frame
+                && (response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if cancel || commit {
+                ui.data_mut(|d| d.remove::<(String, bool)>(key));
+                response.surrender_focus();
+                let name = name.trim();
+                if !cancel && !name.is_empty() && name != track.name {
+                    self.execute(Command::RenameTrack {
+                        track_id: track.id.clone(),
+                        name: name.into(),
+                    });
+                }
+            } else {
+                ui.data_mut(|d| d.insert_temp(key, (name, false)));
+            }
+            response
+        } else {
+            let response = ui
+                .selectable_label(selected, egui::RichText::new(&track.name).color(color))
+                .on_hover_text("Click to rename track");
+            if response.clicked() {
+                self.selected_track = Some(track.id.clone());
+                self.selected_clip = None;
+                self.selected_device = None;
+                ui.data_mut(|d| d.insert_temp(key, (track.name.clone(), true)));
+            }
+            response
+        }
+    }
     fn arrangement(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(0.0))
@@ -1133,6 +1468,20 @@ impl Velvet {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        if ui.small_button("+ MIDI Track").clicked() {
+                                            self.execute(Command::AddMidiTrack {
+                                                name: format!(
+                                                    "MIDI {}",
+                                                    self.session.project.tracks.len() + 1
+                                                ),
+                                            });
+                                            self.selected_track = self
+                                                .session
+                                                .project
+                                                .tracks
+                                                .last()
+                                                .map(|t| t.id.clone());
+                                        }
                                         if ui.small_button("+ Track").clicked() {
                                             let n = self.session.project.tracks.len() + 1;
                                             self.execute(Command::AddTrack {
@@ -1152,6 +1501,7 @@ impl Velvet {
                                         {
                                             self.toggle_clip_loop();
                                         }
+                                        ui.menu_button("Edit", |ui| self.arrangement_menu(ui));
                                         ui.checkbox(&mut self.snap, "Snap");
                                         ui.menu_button("Matrix", |ui| {
                                             ui.checkbox(&mut self.matrix_enabled, "Enabled");
@@ -1296,14 +1646,26 @@ impl Velvet {
                                     row.min,
                                     Pos2::new(controls_x, row.bottom()),
                                 );
+                                let controls =
+                                    Rect::from_min_max(Pos2::new(controls_x, row.top()), row.max);
+                                let header = ui.interact(
+                                    controls,
+                                    egui::Id::new(("track_selection", &t.id)),
+                                    Sense::click(),
+                                );
+                                if header.clicked() {
+                                    self.selected_track = Some(t.id.clone());
+                                    self.selected_clip = None;
+                                    self.selected_device = None;
+                                }
                                 let selected = self.selected_track.as_deref() == Some(&t.id);
                                 let p = ui.painter();
                                 p.rect_filled(timeline, 0.0, Color32::from_black_alpha(50));
                                 p.rect_filled(
                                     Rect::from_min_max(Pos2::new(controls_x, row.top()), row.max),
                                     0.0,
-                                    if selected {
-                                        Color32::from_rgb(20, 24, 29)
+                                    if selected || header.hovered() {
+                                        Color32::from_rgb(30, 38, 45)
                                     } else {
                                         PANEL
                                     },
@@ -1350,26 +1712,26 @@ impl Velvet {
                                                     .small()
                                                     .color(MUTED),
                                             );
-                                            if ui
-                                                .selectable_label(
-                                                    selected,
-                                                    egui::RichText::new(&t.name).color(color),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_track = Some(t.id.clone());
-                                                self.selected_clip = None;
-                                                self.selected_device = None;
-                                            }
+                                            self.track_name_ui(ui, t, selected, color);
                                         });
                                         ui.horizontal(|ui| {
-                                            if ui.selectable_label(t.mixer.mute, "M").clicked() {
+                                            if track_toggle(
+                                                ui,
+                                                "M",
+                                                t.mixer.mute,
+                                                Color32::from_rgb(255, 190, 65),
+                                                "Mute",
+                                            )
+                                            .clicked()
+                                            {
                                                 self.execute(Command::SetMute {
                                                     track_id: t.id.clone(),
                                                     mute: !t.mixer.mute,
                                                 });
                                             }
-                                            if ui.selectable_label(t.mixer.solo, "S").clicked() {
+                                            if track_toggle(ui, "S", t.mixer.solo, CYAN, "Solo")
+                                                .clicked()
+                                            {
                                                 self.execute(Command::SetSolo {
                                                     track_id: t.id.clone(),
                                                     solo: !t.mixer.solo,
@@ -1444,10 +1806,6 @@ impl Velvet {
                                                     self.execute(Command::RemoveTrack {
                                                         track_id: t.id.clone(),
                                                     });
-                                                    if selected {
-                                                        self.selected_track = None;
-                                                        self.selected_clip = None;
-                                                    }
                                                     ui.close_menu();
                                                 }
                                             });
@@ -1479,13 +1837,56 @@ impl Velvet {
                                         self.selected_device = None;
                                     }
                                 }
+                                if self.job.is_none()
+                                    && matches!(t.kind, velvet_core::TrackKind::Audio)
+                                    && hover.is_some_and(|p| {
+                                        timeline.intersect(ui.clip_rect()).contains(p)
+                                    })
+                                    && egui::DragAndDrop::payload::<browser::SampleDrag>(ctx)
+                                        .is_some()
+                                {
+                                    let pos = hover.unwrap();
+                                    let beats = ((pos.x - timeline_x) / self.zoom).max(0.0) as f64;
+                                    let beats = if self.snap {
+                                        (beats * 4.0).round() / 4.0
+                                    } else {
+                                        beats
+                                    };
+                                    let x = timeline_x + beats as f32 * self.zoom;
+                                    ui.painter().line_segment(
+                                        [
+                                            Pos2::new(x, timeline.top()),
+                                            Pos2::new(x, timeline.bottom()),
+                                        ],
+                                        Stroke::new(2.0_f32, CYAN),
+                                    );
+                                    if ui.input(|i| i.pointer.any_released()) {
+                                        let payload = egui::DragAndDrop::take_payload::<
+                                            browser::SampleDrag,
+                                        >(ctx)
+                                        .unwrap();
+                                        self.selected_track = Some(t.id.clone());
+                                        self.import(
+                                            payload.path.clone(),
+                                            Some(t.id.clone()),
+                                            beats,
+                                        );
+                                    }
+                                }
+                                self.instrument_drop(ui, row, &t.id);
+                                self.midi_clip_ui(
+                                    ui, ctx, t, timeline, row, timeline_x, color, navigating,
+                                );
                                 for c in &t.clips {
+                                    let playback_rate =
+                                        c.playback_rate(self.session.project.tempo.bpm);
+                                    let clip_beat_seconds = beat_seconds * playback_rate;
                                     let mut position = c.position.clone();
                                     let x = timeline_x + position.start_beats as f32 * self.zoom;
                                     let rect = Rect::from_min_size(
                                         Pos2::new(x, row.top() + 5.0),
                                         Vec2::new(
-                                            (position.length_seconds / beat_seconds) as f32
+                                            (position.length_seconds / clip_beat_seconds) as f32
                                                 * self.zoom,
                                             height - 14.0,
                                         ),
@@ -1516,7 +1917,7 @@ impl Velvet {
                                                 if p.x < rect.left() + 8.0 {
                                                     1
                                                 } else if p.x > rect.right() - 8.0 {
-                                                    2
+                                                    if ctx.input(|i| i.modifiers.shift) { 3 } else { 2 }
                                                 } else {
                                                     0
                                                 }
@@ -1557,24 +1958,24 @@ impl Velvet {
                                                         };
                                                     }
                                                     1 => {
-                                                        let seconds = (delta * beat_seconds)
+                                                        let seconds = (delta * clip_beat_seconds)
                                                             .clamp(
                                                                 -position.offset_seconds,
                                                                 position.length_seconds - 0.01,
                                                             )
                                                             .max(
                                                                 -position.start_beats
-                                                                    * beat_seconds,
+                                                                    * clip_beat_seconds,
                                                             );
                                                         position.start_beats +=
-                                                            seconds / beat_seconds;
+                                                            seconds / clip_beat_seconds;
                                                         position.offset_seconds += seconds;
                                                         position.length_seconds -= seconds;
                                                     }
                                                     _ => {
                                                         position.length_seconds = (position
                                                             .length_seconds
-                                                            + delta * beat_seconds)
+                                                            + delta * clip_beat_seconds)
                                                             .max(0.01);
                                                     }
                                                 }
@@ -1588,6 +1989,11 @@ impl Velvet {
                                                     track_id: d.track,
                                                     clip_id: d.clip,
                                                     start_beats: position.start_beats,
+                                                });
+                                            } else if d.mode == 3 {
+                                                self.execute(Command::SetClipTempo {
+                                                    track_id: d.track, clip_id: d.clip,
+                                                    source_bpm: Some(c.source_bpm.unwrap_or(self.session.project.tempo.bpm) * position.length_seconds / d.position.length_seconds),
                                                 });
                                             } else {
                                                 self.execute(Command::SetClipPosition {
@@ -1604,7 +2010,7 @@ impl Velvet {
                                             row.top() + 5.0,
                                         ),
                                         Vec2::new(
-                                            ((position.length_seconds / beat_seconds) as f32
+                                            ((position.length_seconds / clip_beat_seconds) as f32
                                                 * self.zoom)
                                                 .max(3.0),
                                             height - 14.0,
@@ -1646,7 +2052,8 @@ impl Velvet {
                                     );
                                     let label =
                                         path.file_stem().unwrap_or_default().to_string_lossy();
-                                    let p = p.with_clip_rect(visible.shrink(3.0));
+                                    let p =
+                                        p.with_clip_rect(visible.shrink(3.0).intersect(timeline));
                                     p.text(
                                         visible.min + Vec2::new(7.0, 12.0),
                                         egui::Align2::LEFT_CENTER,
@@ -1661,8 +2068,14 @@ impl Velvet {
                                     if let Some(data) = self.cache.files.get(&path) {
                                         waveform(&p, visible, data, &position, color);
                                     }
+                                    response.context_menu(|ui| {
+                                        self.selected_track = Some(t.id.clone());
+                                        self.selected_clip = Some(c.id.clone());
+                                        self.selected_device = None;
+                                        self.arrangement_menu(ui);
+                                    });
                                     response.on_hover_text(format!(
-                                        "{}\nDrag to move · Drag edges to trim\n{}",
+                                        "{}\nDrag to move · Drag edges to trim · Shift+right edge to resample\n{}",
                                         path.display(),
                                         if missing {
                                             "Missing source — locate in clip controls"
@@ -1688,15 +2101,15 @@ impl Velvet {
                                 ruler.min,
                                 Pos2::new(controls_x, end_y),
                             ));
-                            for beat in 0..=(total_beats as usize) {
-                                let x = timeline_x + beat as f32 * self.zoom;
-                                if beat % 4 == 0 {
-                                    grid_painter.line_segment(
-                                        [Pos2::new(x, ruler.bottom()), Pos2::new(x, end_y)],
-                                        Stroke::new(0.5_f32, Color32::from_white_alpha(9)),
-                                    );
-                                }
-                            }
+                            paint_musical_grid(
+                                &grid_painter,
+                                Rect::from_min_max(
+                                    ruler.left_bottom(),
+                                    Pos2::new(controls_x, end_y),
+                                ),
+                                timeline_x,
+                                self.zoom,
+                            );
                             let marker_x = timeline_x + self.grid_start_beats as f32 * self.zoom;
                             let marker = ui.painter().with_clip_rect(Rect::from_min_max(
                                 ruler.min,
@@ -1705,24 +2118,13 @@ impl Velvet {
                             if let Some((start, end)) = self.loop_range() {
                                 let left = timeline_x + (start / beat_seconds) as f32 * self.zoom;
                                 let right = timeline_x + (end / beat_seconds) as f32 * self.zoom;
-                                let range = Rect::from_min_max(
-                                    Pos2::new(left, ruler.top()),
-                                    Pos2::new(right, end_y),
-                                );
-                                marker.rect_filled(range, 0.0, CYAN.gamma_multiply(0.06));
                                 marker.line_segment(
                                     [
                                         Pos2::new(left, ruler.bottom() - 2.0),
                                         Pos2::new(right, ruler.bottom() - 2.0),
                                     ],
-                                    Stroke::new(3.0_f32, CYAN),
+                                    Stroke::new(1.5_f32, CYAN.gamma_multiply(0.45)),
                                 );
-                                for x in [left, right] {
-                                    marker.line_segment(
-                                        [Pos2::new(x, ruler.top()), Pos2::new(x, end_y)],
-                                        Stroke::new(1.0_f32, CYAN.gamma_multiply(0.6)),
-                                    );
-                                }
                             }
                             marker.line_segment(
                                 [
@@ -1783,6 +2185,39 @@ impl Velvet {
                                     );
                                 });
                             }
+                            if self.job.is_none()
+                                && drop_target.is_none()
+                                && hover.is_some_and(|p| {
+                                    ui.clip_rect().contains(p)
+                                        && p.x >= ruler.left()
+                                        && p.x < controls_x
+                                        && p.y > ruler.bottom()
+                                })
+                                && egui::DragAndDrop::payload::<browser::SampleDrag>(ctx).is_some()
+                                && ui.input(|i| i.pointer.any_released())
+                            {
+                                let payload =
+                                    egui::DragAndDrop::take_payload::<browser::SampleDrag>(ctx)
+                                        .unwrap();
+                                let beats =
+                                    ((hover.unwrap().x - timeline_x) / self.zoom).max(0.0) as f64;
+                                let beats = if self.snap {
+                                    (beats * 4.0).round() / 4.0
+                                } else {
+                                    beats
+                                };
+                                self.execute(Command::AddTrack {
+                                    name: payload
+                                        .path
+                                        .file_stem()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                });
+                                let target = self.session.project.tracks.last().unwrap().id.clone();
+                                self.selected_track = Some(target.clone());
+                                self.import(payload.path.clone(), Some(target), beats);
+                            }
                             if self.job.is_none() {
                                 let files = ctx.input(|i| i.raw.dropped_files.clone());
                                 if let Some(path) = files.first().and_then(|f| f.path.clone()) {
@@ -1828,23 +2263,91 @@ impl Velvet {
 fn eyebrow(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).monospace().size(9.0).color(MUTED));
 }
-fn waveform(p: &egui::Painter, r: Rect, data: &AudioData, pos: &Position, color: Color32) {
-    let width = r.width().max(1.0) as usize;
+fn musical_grid_divisions(zoom: f32) -> usize {
+    if zoom >= 32.0 {
+        4
+    } else if zoom >= 16.0 {
+        2
+    } else {
+        1
+    }
+}
+fn paint_musical_grid(p: &egui::Painter, rect: Rect, origin: f32, zoom: f32) {
+    let divisions = musical_grid_divisions(zoom);
+    let step = zoom / divisions as f32;
+    let first = ((rect.left() - origin) / step).ceil().max(0.0) as usize;
+    let last = ((rect.right() - origin) / step).floor().max(0.0) as usize;
+    for tick in first..=last {
+        let x = origin + tick as f32 * step;
+        let (width, alpha): (f32, u8) = if tick % (4 * divisions) == 0 {
+            (1.0, 65)
+        } else if tick % divisions == 0 {
+            (1.0, 8)
+        } else {
+            (0.5, 3)
+        };
+        p.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(width, Color32::from_white_alpha(alpha)),
+        );
+    }
+}
+fn waveform(p: &egui::Painter, r: Rect, data: &Arc<AudioData>, pos: &Position, color: Color32) {
+    let width = r.width().max(1.0);
+    let bins = (width / 2.0).ceil() as usize;
+    let key = egui::Id::new(("waveform_peaks", data.frames.as_ptr() as usize));
+    let signature = (
+        data.frames.len(),
+        data.sample_rate,
+        pos.offset_seconds.to_bits(),
+        pos.length_seconds.to_bits(),
+        width.to_bits(),
+    );
+    type CachedPeaks = (
+        (usize, u32, u64, u64, u32),
+        std::sync::Weak<AudioData>,
+        Arc<Vec<f32>>,
+    );
+    let cached = p
+        .ctx()
+        .data_mut(|memory| memory.get_temp::<CachedPeaks>(key));
+    let peaks = cached
+        .filter(|(previous, source, _)| {
+            *previous == signature
+                && source
+                    .upgrade()
+                    .is_some_and(|source| Arc::ptr_eq(&source, data))
+        })
+        .map(|(_, _, peaks)| peaks)
+        .unwrap_or_else(|| {
+            let peaks = Arc::new(
+                (0..bins)
+                    .map(|bin| {
+                        let sample = |pixel: f64| {
+                            (pos.offset_seconds + pixel / width as f64 * pos.length_seconds)
+                                * data.sample_rate as f64
+                        };
+                        let begin = sample((bin * 2) as f64).floor() as usize;
+                        let end = sample(((bin + 1) * 2) as f64).ceil() as usize;
+                        data.frames[begin.min(data.frames.len())..end.min(data.frames.len())]
+                            .iter()
+                            .fold(0.0_f32, |peak, frame| {
+                                peak.max(frame[0].abs()).max(frame[1].abs())
+                            })
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            p.ctx().data_mut(|memory| {
+                memory.insert_temp(key, (signature, Arc::downgrade(data), peaks.clone()))
+            });
+            peaks
+        });
     let center = r.center().y + 11.0;
-    for pixel in (0..width).step_by(4) {
-        let begin = ((pos.offset_seconds + pixel as f64 / width as f64 * pos.length_seconds)
-            * data.sample_rate as f64) as usize;
-        let end = ((pos.offset_seconds + (pixel + 4) as f64 / width as f64 * pos.length_seconds)
-            * data.sample_rate as f64) as usize;
-        let mut peak = 0.0_f32;
-        let step = ((end.saturating_sub(begin)) / 32).max(1);
-        for i in (begin.min(data.frames.len())..end.min(data.frames.len())).step_by(step) {
-            peak = peak
-                .max(data.frames[i][0].abs())
-                .max(data.frames[i][1].abs());
-        }
+    let first = ((p.clip_rect().left() - r.left()).max(0.0) / 2.0).floor() as usize;
+    let last = (((p.clip_rect().right() - r.left()).max(0.0) / 2.0).ceil() as usize).min(bins);
+    for (bin, &peak) in peaks.iter().enumerate().take(last).skip(first) {
         let amp = (peak.min(1.0) * (r.height() - 26.0).max(1.0) * 0.5).max(0.5);
-        let x = r.left() + pixel as f32;
+        let x = r.left() + bin as f32 * 2.0;
         p.line_segment(
             [Pos2::new(x, center - amp), Pos2::new(x, center + amp)],
             Stroke::new(1.0_f32, color.gamma_multiply(0.8)),
@@ -1853,7 +2356,10 @@ fn waveform(p: &egui::Painter, r: Rect, data: &AudioData, pos: &Position, color:
 }
 impl eframe::App for Velvet {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.poll_sample_preview();
+        self.poll_note_preview();
         self.poll();
+        self.poll_plugin_editor(ctx);
         self.update_live_mix();
         let loop_range = self.loop_range();
         if loop_range.is_none() {
@@ -1862,6 +2368,7 @@ impl eframe::App for Velvet {
         if let Some(player) = &self.player {
             player.set_loop(loop_range);
             player.set_metronome(self.metronome.then_some(self.session.project.tempo.bpm));
+            player.set_monitor_gain(self.monitor_volume, true);
         }
         if self.job.is_none() && ctx.input(|i| i.pointer.any_pressed()) {
             self.gesture = Some((self.session.project.clone(), self.session.revision));
@@ -1933,6 +2440,17 @@ impl eframe::App for Velvet {
                                 self.selected_device = None;
                             }
                         });
+                        ui.separator();
+                        ui.spacing_mut().slider_width = 74.0;
+                        if ui.add(egui::Slider::new(&mut self.monitor_volume, 0.0..=1.0).show_value(false))
+                            .on_hover_text("Sample preview and metronome volume").changed() {
+                            if let Some(player) = &self.player { player.set_monitor_gain(self.monitor_volume, true); }
+                            for player in [&self.sample_preview, &self.note_preview].into_iter().flatten() {
+                                player.set_monitor_gain(self.monitor_volume, false);
+                            }
+                        }
+                        ui.label("Preview / Metro");
+
                     });
                 });
             });
@@ -1940,6 +2458,8 @@ impl eframe::App for Velvet {
         self.browser(ctx);
         self.ai(ctx);
         self.arrangement(ctx);
+        self.midi_editor(ctx);
+        self.synth_editor(ctx);
         ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("monolith_border"),
@@ -1981,9 +2501,13 @@ impl eframe::App for Velvet {
                     });
                 });
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.session.project != self.saved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.closing = true;
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if !self.capture_plugin_state() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if self.session.project != self.saved {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.closing = true;
+            }
         }
         if self.closing {
             egui::Window::new("Save before closing?")
@@ -1992,7 +2516,7 @@ impl eframe::App for Velvet {
                     ui.label("Your project has unsaved edits.");
                     if ui.button("Save and close").clicked() {
                         self.save(false);
-                        if self.session.project == self.saved {
+                        if self.session.project == self.saved && !self.error {
                             self.closing = false;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
@@ -2043,6 +2567,382 @@ impl eframe::App for Velvet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn synced_clip_loop_and_waveform_share_the_musical_grid() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Grid sync"), PathBuf::new());
+        app.session
+            .execute(Command::AddTrack {
+                name: "Audio".into(),
+            })
+            .unwrap();
+        let track = app.session.project.tracks[0].id.clone();
+        app.session
+            .execute(Command::ImportAudioClip {
+                track_id: track.clone(),
+                source: Source {
+                    path: std::path::absolute("grid.wav").unwrap(),
+                    kind: SourceKind::External,
+                },
+                position: Position {
+                    start_beats: 4.0,
+                    offset_seconds: 0.5,
+                    length_seconds: 2.0,
+                },
+            })
+            .unwrap();
+        let clip = app.session.project.tracks[0].clips[0].id.clone();
+        app.session
+            .execute(Command::SetClipTempo {
+                track_id: track.clone(),
+                clip_id: clip.clone(),
+                source_bpm: Some(120.0),
+            })
+            .unwrap();
+        app.loop_clip = Some((track, clip));
+        let mut frames = vec![[0.0; 2]; 3000];
+        frames[1000] = [1.0; 2];
+        let data = Arc::new(AudioData {
+            sample_rate: 1000,
+            frames,
+        });
+        for bpm in [60.0, 120.0, 240.0] {
+            app.execute(Command::SetTempo { bpm });
+            assert_eq!(app.loop_range(), Some((4.0 * 60.0 / bpm, 8.0 * 60.0 / bpm)));
+            let clip = &app.session.project.tracks[0].clips[0];
+            let zoom = 40.0;
+            let rect = Rect::from_min_size(
+                Pos2::new(160.0, 0.0),
+                Vec2::new(
+                    (clip.duration_seconds(bpm) * bpm / 60.0) as f32 * zoom,
+                    80.0,
+                ),
+            );
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                paint_musical_grid(&painter, rect, 0.0, zoom);
+                waveform(&painter, rect, &data, &clip.position, CYAN);
+            });
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::LineSegment { points, stroke } if stroke.color == CYAN.gamma_multiply(0.8) && points[0].x == 200.0 && (points[1].y - points[0].y).abs() > 40.0
+            )), "Waveform attack missed beat 5 at {bpm} BPM");
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::LineSegment { points, stroke } if points[0].x == 170.0 && stroke.color == Color32::from_white_alpha(14)
+            )), "Missing sixteenth-note grid");
+        }
+    }
+    #[test]
+    fn tempo_edits_and_history_keep_the_playhead_on_the_same_beat() {
+        let mut app = Velvet::new(&egui::Context::default());
+        app.session = Session::new(Project::new("Tempo sync"), PathBuf::new());
+        app.session.transport.seconds = 4.0;
+        app.execute(Command::SetTempo { bpm: 60.0 });
+        assert_eq!(app.session.transport.seconds, 8.0);
+        app.history(false);
+        assert_eq!(app.session.transport.seconds, 4.0);
+        app.history(true);
+        assert_eq!(app.session.transport.seconds, 8.0);
+    }
+    #[test]
+    fn waveform_keeps_short_audio_attacks_on_the_timeline() {
+        let ctx = egui::Context::default();
+        let mut frames = vec![[0.0; 2]; 4000];
+        frames[31] = [1.0; 2];
+        let data = Arc::new(AudioData {
+            sample_rate: 1000,
+            frames,
+        });
+        let position = Position {
+            start_beats: 0.0,
+            offset_seconds: 0.0,
+            length_seconds: 4.0,
+        };
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            waveform(
+                &painter,
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(40.0, 80.0)),
+                &data,
+                &position,
+                CYAN,
+            );
+        });
+        assert!(
+            output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::LineSegment { points, .. } if (points[1].y - points[0].y).abs() > 40.0
+            )),
+            "A short audible attack disappeared from the audio waveform"
+        );
+    }
+    #[test]
+    #[ignore = "Requires a real default audio output device"]
+    fn hardware_stale_initial_mix_is_rebuilt_after_mixer_edits() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Stale mix"), PathBuf::new());
+        app.job = None;
+        app.execute(Command::AddMidiTrack { name: "Dot".into() });
+        let track_id = app.session.project.tracks[0].id.clone();
+        app.execute(Command::SetTrackInstrument {
+            track_id: track_id.clone(),
+            kind: Some("builtin.dot".into()),
+        });
+        app.execute(Command::SetMidiNotes {
+            track_id: track_id.clone(),
+            notes: vec![velvet_core::MidiNote::default()],
+        });
+        let revision = app.session.revision;
+        let rate = Player::output_rate().unwrap();
+        let mix = velvet_audio::mix(
+            &app.session.project,
+            &app.session.root,
+            rate,
+            &mut app.cache,
+        )
+        .unwrap();
+        assert!(mix.peak > 0.0);
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(rx);
+        tx.send(Job::Mix(revision, Ok(mix))).unwrap();
+        app.execute(Command::SetMute {
+            track_id,
+            mute: true,
+        });
+        app.poll();
+        assert!(
+            app.player.is_none(),
+            "Stale unmuted audio reached the player"
+        );
+        let pending = app.job.take().expect("Current mix was not scheduled");
+        let Job::Mix(current, result) = pending.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("Expected a rebuilt audio mix");
+        };
+        assert_eq!(current, app.session.revision);
+        assert_eq!(result.unwrap().peak, 0.0);
+    }
+    #[test]
+    fn mixer_edits_during_audio_preparation_are_not_lost() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Pending mix"), PathBuf::new());
+        app.execute(Command::AddTrack {
+            name: "Audio".into(),
+        });
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(rx);
+        app.busy = "Preparing audio".into();
+        let track_id = app.session.project.tracks[0].id.clone();
+        for command in [
+            Command::SetMute {
+                track_id: track_id.clone(),
+                mute: true,
+            },
+            Command::SetSolo {
+                track_id,
+                solo: true,
+            },
+        ] {
+            app.execute(command);
+            assert!(
+                app.live_dirty,
+                "Mixer edit was lost while preparing the initial mix"
+            );
+            app.edit_time = Instant::now() - Duration::from_millis(50);
+            app.update_live_mix();
+            assert!(
+                app.live_dirty,
+                "Pending edit was consumed before a player existed"
+            );
+            assert!(app.live_job.is_none());
+        }
+    }
+    #[test]
+    fn arrangement_mute_and_solo_clicks_change_the_audio_mix() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Mixer buttons"), PathBuf::new());
+        app.job = None;
+        for name in ["First", "Second"] {
+            app.execute(Command::AddMidiTrack { name: name.into() });
+        }
+        for (i, track) in app.session.project.tracks.iter_mut().enumerate() {
+            track.synth = Some(velvet_core::Device::new("builtin.dot").unwrap());
+            track.notes.push(velvet_core::MidiNote {
+                key: 60 + i as u8 * 7,
+                start_beats: 0.0,
+                length_beats: 1.0,
+                velocity: 100,
+                ..Default::default()
+            });
+        }
+        let frame = |app: &mut Velvet, events| {
+            ctx.run(input(events, egui::Modifiers::NONE), |ctx| {
+                app.arrangement(ctx)
+            })
+        };
+        frame(&mut app, vec![]);
+        let output = frame(&mut app, vec![]);
+        let buttons: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(t) = &shape.shape {
+                    if t.galley.job.text == "M" || t.galley.job.text == "S" {
+                        return Some(t.pos + t.galley.size() * 0.5);
+                    }
+                }
+                None
+            })
+            .collect();
+        assert_eq!(buttons.len(), 4);
+        let render = |app: &mut Velvet| {
+            velvet_audio::mix(
+                &app.session.project,
+                &app.session.root,
+                8000,
+                &mut app.cache,
+            )
+            .unwrap()
+            .frames
+        };
+        let full = render(&mut app);
+        assert!(full.iter().flatten().any(|s| s.abs() > 0.01));
+        for (button, track, solo, active) in [
+            (0, 0, false, true),
+            (0, 0, false, false),
+            (3, 1, true, true),
+            (3, 1, true, false),
+            (2, 1, false, true),
+            (2, 1, false, false),
+            (1, 0, true, true),
+            (1, 0, true, false),
+        ] {
+            let pos = buttons[button];
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            let mixer = &app.session.project.tracks[track].mixer;
+            assert_eq!(
+                if solo { mixer.solo } else { mixer.mute },
+                active,
+                "Button {button} did not toggle its track"
+            );
+            let audio = render(&mut app);
+            assert!(
+                if active { audio != full } else { audio == full },
+                "Button {button} did not update the audio"
+            );
+        }
+    }
+    #[test]
+    fn track_toggle_keeps_active_color_on_selected_and_hovered_headers() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for color in [Color32::from_rgb(255, 190, 65), CYAN] {
+            for hovered in [false, true] {
+                let events = if hovered {
+                    vec![egui::Event::PointerMoved(Pos2::new(20.0, 20.0))]
+                } else {
+                    vec![]
+                };
+                let output = ctx.run(input(events, egui::Modifiers::NONE), |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE.fill(Color32::from_rgb(30, 38, 45)))
+                        .show(ctx, |ui| {
+                            track_toggle(ui, "M", true, color, "Mute");
+                        });
+                });
+                assert!(output
+                    .shapes
+                    .iter()
+                    .any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == color)));
+            }
+        }
+    }
+    #[test]
+    fn track_name_click_edit_commit_cancel_and_undo() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Rename"), PathBuf::new());
+        app.job = None;
+        app.execute(Command::AddTrack {
+            name: "MIDI 4".into(),
+        });
+        let track = app.session.project.tracks[0].clone();
+        let edit_id = egui::Id::new(("track_name_edit", &track.id));
+        let frame = |app: &mut Velvet, events| {
+            let mut rect = Rect::NOTHING;
+            let _ = ctx.run(input(events, egui::Modifiers::NONE), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    rect = app.track_name_ui(ui, &track, true, CYAN).rect;
+                });
+            });
+            rect
+        };
+        let pos = frame(&mut app, vec![]).center();
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(ctx
+            .data_mut(|d| d.get_temp::<(String, bool)>(edit_id))
+            .is_some());
+        frame(&mut app, vec![]);
+        assert!(ctx.memory(|m| m.has_focus(edit_id)));
+        ctx.data_mut(|d| d.insert_temp(edit_id, ("  Piano  ".to_string(), false)));
+        frame(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        assert_eq!(app.session.project.tracks[0].name, "Piano");
+        app.history(false);
+        assert_eq!(app.session.project.tracks[0].name, "MIDI 4");
+        for (draft, end_key) in [("Cancelled", egui::Key::Escape), ("   ", egui::Key::Enter)] {
+            ctx.data_mut(|d| d.insert_temp(edit_id, (draft.to_string(), true)));
+            frame(&mut app, vec![]);
+            frame(&mut app, vec![key(end_key, egui::Modifiers::NONE)]);
+            assert_eq!(app.session.project.tracks[0].name, "MIDI 4");
+            assert!(ctx
+                .data_mut(|d| d.get_temp::<(String, bool)>(edit_id))
+                .is_none());
+        }
+        ctx.data_mut(|d| d.insert_temp(edit_id, ("Bass".to_string(), true)));
+        frame(&mut app, vec![]);
+        let pos = Pos2::new(800.0, 200.0);
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(app.session.project.tracks[0].name, "Bass");
+    }
     fn input(events: Vec<egui::Event>, modifiers: egui::Modifiers) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0))),
@@ -2142,6 +3042,46 @@ mod tests {
             .as_ref()
             .expect("First Play never created the player")
             .playing());
+    }
+    #[test]
+    fn backspace_removes_selected_track_and_undo_restores_it() {
+        let ctx = egui::Context::default();
+        let mut app = Velvet::new(&ctx);
+        app.session = Session::new(Project::new("Selection"), PathBuf::new());
+        app.job = None;
+        app.execute(Command::AddTrack {
+            name: "Audio".into(),
+        });
+        let track = app.session.project.tracks[0].id.clone();
+        app.selected_track = Some(track.clone());
+        let _ = ctx.run(
+            input(
+                vec![key(egui::Key::Backspace, egui::Modifiers::NONE)],
+                egui::Modifiers::NONE,
+            ),
+            |ctx| app.shortcuts(ctx),
+        );
+        assert!(app.session.project.tracks.is_empty());
+        assert!(app.selected_track.is_none());
+        app.history(false);
+        assert_eq!(app.session.project.tracks[0].id, track);
+        assert_eq!(app.selected_track.as_ref(), Some(&track));
+        app.execute(Command::AddTrack {
+            name: "Middle".into(),
+        });
+        app.execute(Command::AddTrack {
+            name: "Last".into(),
+        });
+        let middle = app.session.project.tracks[1].id.clone();
+        let last = app.session.project.tracks[2].id.clone();
+        app.selected_track = Some(middle);
+        app.remove_selection();
+        assert_eq!(app.selected_track.as_ref(), Some(&last));
+        app.remove_selection();
+        assert_eq!(app.selected_track.as_ref(), Some(&track));
+        app.selected_track = Some("master".into());
+        app.remove_selection();
+        assert_eq!(app.session.project.tracks.len(), 1);
     }
     #[test]
     fn loop_shortcut_follows_clip_edits_and_backspace_removes_only_the_selected_effect() {
@@ -2270,16 +3210,18 @@ mod tests {
         app.zoom = 44.0;
         let original = frame(&mut app, &ctx);
         assert!(
-            (original[1].x - original[0].x - 20.0).abs() < 0.001,
+            (original[1].x - original[0].x - 11.0).abs() < 0.001,
             "The matrix must use arrangement zoom, not screen coordinates"
         );
         app.zoom = 88.0;
         let zoomed = frame(&mut app, &ctx);
-        assert!((zoomed[1].x - zoomed[0].x - 40.0).abs() < 0.001);
+        assert!((zoomed[1].x - zoomed[0].x - 22.0).abs() < 0.001);
         app.timeline_scroll = 0.125;
         let panned = frame(&mut app, &ctx);
         assert!(
-            (panned[0].x - zoomed[0].x + 11.0).abs() < 0.001,
+            panned
+                .iter()
+                .any(|point| point.distance(zoomed[3] - Vec2::new(11.0, 0.0)) < 0.001),
             "Horizontal pan must move the same world grid"
         );
         let origin = app.matrix.view.as_ref().unwrap().origin;
@@ -2487,6 +3429,7 @@ mod tests {
         app.player = Some(
             Player::new(
                 Arc::new(Mix {
+                    device_signals: Default::default(),
                     sample_rate: rate,
                     frames: vec![[0.0; 2]; rate as usize * 2],
                     missing: vec![],

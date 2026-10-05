@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/core", "crates/audio", "crates/ai", "crates/cli", "crates/app"]
+exclude = ["vendor/vst3-host"]
 resolver = "2"
 
 [workspace.package]
@@ -29,3 +30,9 @@ opt-level = 2
 [profile.dev.package.velvet-audio]
 opt-level = 2
 
+[profile.dev.package.vst3-host]
+opt-level = 2
+
+
+[patch.crates-io]
+vst3-host = { path = "vendor/vst3-host" }

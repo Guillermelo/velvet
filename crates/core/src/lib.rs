@@ -8,6 +8,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub mod beat;
+
 pub fn id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
@@ -45,6 +47,12 @@ pub struct Tempo {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Track {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_region: Option<MidiRegion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synth: Option<Device>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<MidiNote>,
     pub id: String,
     pub name: String,
     #[serde(rename = "type")]
@@ -58,6 +66,108 @@ pub struct Track {
     #[serde(default)]
     pub devices: Vec<Device>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MidiNote {
+    pub key: u8,
+    pub velocity: u8,
+    pub start_beats: f64,
+    pub length_beats: f64,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default = "default_midi_channel")]
+    pub channel: u8,
+}
+fn default_midi_channel() -> u8 {
+    1
+}
+impl MidiNote {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.key <= 127
+                && (1..=127).contains(&self.velocity)
+                && (1..=16).contains(&self.channel)
+                && self.start_beats.is_finite()
+                && self.start_beats >= 0.0
+                && self.length_beats.is_finite()
+                && self.length_beats > 0.0,
+            "Invalid MIDI note"
+        );
+        Ok(())
+    }
+}
+impl Default for MidiNote {
+    fn default() -> Self {
+        Self {
+            key: 60,
+            velocity: 100,
+            start_beats: 0.0,
+            length_beats: 1.0,
+            muted: false,
+            channel: 1,
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MidiRegion {
+    pub start_beats: f64,
+    pub offset_beats: f64,
+    pub length_beats: f64,
+}
+impl Track {
+    pub fn midi_region(&self) -> Option<MidiRegion> {
+        if !matches!(self.kind, TrackKind::Midi) {
+            return None;
+        }
+        if let Some(region) = &self.midi_region {
+            return Some(region.clone());
+        }
+        if self.notes.is_empty() {
+            return None;
+        }
+        let start = (self
+            .notes
+            .iter()
+            .map(|n| n.start_beats)
+            .fold(f64::INFINITY, f64::min)
+            / 4.0)
+            .floor()
+            * 4.0;
+        let end = (self
+            .notes
+            .iter()
+            .map(|n| n.start_beats + n.length_beats)
+            .fold(0.0, f64::max)
+            / 4.0)
+            .ceil()
+            * 4.0;
+        Some(MidiRegion {
+            start_beats: start,
+            offset_beats: start,
+            length_beats: end - start,
+        })
+    }
+    pub fn arranged_midi_notes(&self) -> Vec<MidiNote> {
+        let Some(region) = self.midi_region() else {
+            return Vec::new();
+        };
+        self.notes
+            .iter()
+            .filter(|n| !n.muted)
+            .filter_map(|n| {
+                let start = n.start_beats.max(region.offset_beats);
+                let end =
+                    (n.start_beats + n.length_beats).min(region.offset_beats + region.length_beats);
+                (end > start).then(|| MidiNote {
+                    start_beats: start - region.offset_beats + region.start_beats,
+                    length_beats: end - start,
+                    ..n.clone()
+                })
+            })
+            .collect()
+    }
+}
 fn default_color() -> [u8; 3] {
     [120, 157, 156]
 }
@@ -65,6 +175,7 @@ fn default_color() -> [u8; 3] {
 #[serde(rename_all = "snake_case")]
 pub enum TrackKind {
     Audio,
+    Midi,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -90,6 +201,16 @@ pub struct Clip {
     pub id: String,
     pub source: Source,
     pub position: Position,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bpm: Option<f64>,
+}
+impl Clip {
+    pub fn playback_rate(&self, bpm: f64) -> f64 {
+        self.source_bpm.map_or(1.0, |source| bpm / source)
+    }
+    pub fn duration_seconds(&self, bpm: f64) -> f64 {
+        self.position.length_seconds / self.playback_rate(bpm)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -117,10 +238,61 @@ pub struct Device {
     #[serde(rename = "type")]
     pub kind: String,
     pub parameters: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugin_state: Vec<u8>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub beat_envelopes: BTreeMap<String, Vec<beat::BeatPoint>>,
 }
 impl Device {
+    pub fn plugin_path(&self) -> Option<&Path> {
+        self.kind
+            .strip_prefix("vst3.effect:")
+            .or_else(|| self.kind.strip_prefix("vst3.instrument:"))
+            .map(Path::new)
+    }
+    pub fn display_name(&self) -> String {
+        if let Some(path) = self.plugin_path() {
+            return path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+        }
+        if self.kind == "builtin.dot" {
+            return "Dot".into();
+        }
+        BUILTIN_DEVICES
+            .iter()
+            .find(|(_, k, _)| *k == self.kind)
+            .map_or(self.kind.clone(), |(name, _, _)| (*name).into())
+    }
     pub fn new(kind: &str) -> Result<Self> {
         let defaults: &[(&str, f64)] = match kind {
+            "builtin.dot" => &[
+                ("wave_type", 0.0),
+                ("gain_db", -12.0),
+                ("cutoff_freq_hz", 6000.0),
+                ("attack_ms", 10.0),
+                ("decay_ms", 180.0),
+                ("sustain", 0.65),
+                ("release_ms", 250.0),
+            ],
+            "builtin.beat" => &[
+                ("time_slot", 0.0),
+                ("volume_slot", 0.0),
+                ("time_mix", 1.0),
+                ("volume_mix", 1.0),
+                ("mix", 1.0),
+                ("loop_beats", 4.0),
+                ("attack_ms", 1.0),
+                ("release_ms", 10.0),
+                ("smooth_ms", 2.0),
+                ("offset_beats", 0.0),
+                ("hold_enabled", 0.0),
+                ("link_enabled", 0.0),
+                ("bypass_enabled", 0.0),
+                ("tension", 0.0),
+            ],
             "builtin.gain" => &[("gain_db", 0.0)],
             "builtin.eq" => &[
                 ("low_gain_db", 0.0),
@@ -141,6 +313,7 @@ impl Device {
                 ("ceiling_db", -1.0),
                 ("release_ms", 80.0),
             ],
+            k if k.starts_with("vst3.effect:") || k.starts_with("vst3.instrument:") => &[],
             _ => bail!("Unknown device: {kind}"),
         };
         let mut parameters: BTreeMap<_, _> =
@@ -165,6 +338,8 @@ impl Device {
             id: id("device"),
             kind: kind.into(),
             parameters,
+            plugin_state: vec![],
+            beat_envelopes: BTreeMap::new(),
         })
     }
     pub fn parameter_range(&self, parameter: &str) -> Result<(f64, f64)> {
@@ -172,7 +347,22 @@ impl Device {
             self.parameters.contains_key(parameter),
             "Unknown device parameter: {parameter}"
         );
+        if self.kind == "builtin.beat" {
+            return Ok(match parameter {
+                "time_slot" | "volume_slot" => (0.0, 35.0),
+                "loop_beats" => (0.25, 8.0),
+                "attack_ms" => (0.0, 500.0),
+                "release_ms" => (0.0, 1000.0),
+                "smooth_ms" => (0.0, 50.0),
+                "offset_beats" => (0.0, 8.0),
+                "tension" => (-1.0, 1.0),
+                _ => (0.0, 1.0),
+            });
+        }
         Ok(match parameter {
+            "wave_type" => (0.0, 3.0),
+            "sustain" => (0.0, 1.0),
+            "decay_ms" => (1.0, 2000.0),
             "threshold_db" => (-60.0, 0.0),
             "ratio" => (1.0, 20.0),
             "attack_ms" => (0.1, 200.0),
@@ -187,6 +377,69 @@ impl Device {
         })
     }
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.kind == "builtin.beat" || self.beat_envelopes.is_empty(),
+            "Envelopes require Beat"
+        );
+        ensure!(
+            self.beat_envelopes.len() <= 72,
+            "Beat has 72 envelope slots"
+        );
+        for (key, points) in &self.beat_envelopes {
+            let (lane, slot) = key.split_once(':').context("Invalid envelope slot")?;
+            ensure!(
+                matches!(lane, "time" | "volume") && slot.parse::<usize>().is_ok_and(|s| s < 36),
+                "Invalid envelope slot"
+            );
+            ensure!(
+                key == &format!("{lane}:{}", slot.parse::<usize>()?),
+                "Invalid envelope slot spelling"
+            );
+            ensure!(
+                (2..=256).contains(&points.len()),
+                "Envelope needs 2–256 points"
+            );
+            ensure!(
+                points[0].x == 0.0 && points.last().unwrap().x == 1.0,
+                "Envelope endpoints must be 0 and 1"
+            );
+            for point in points {
+                ensure!(
+                    point.x.is_finite()
+                        && (0.0..=1.0).contains(&point.x)
+                        && point.y.is_finite()
+                        && (0.0..=if lane == "time" { 2.0 } else { 1.0 }).contains(&point.y)
+                        && point.curve <= 2,
+                    "Invalid envelope point"
+                );
+            }
+            ensure!(
+                points.windows(2).all(|p| p[0].x < p[1].x),
+                "Envelope points must be ordered"
+            );
+        }
+        if let Some(path) = self.plugin_path() {
+            ensure!(
+                path.is_absolute()
+                    && path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("vst3")),
+                "VST3 path must be absolute and end in .vst3"
+            );
+            ensure!(
+                self.parameters.is_empty(),
+                "VST3 settings are stored in plugin state"
+            );
+            ensure!(
+                self.plugin_state.len() <= 16 * 1024 * 1024,
+                "Plugin state exceeds 16 MiB"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.plugin_state.is_empty(),
+            "Built-in devices cannot contain plugin state"
+        );
         let prototype = Self::new(&self.kind)?;
         ensure!(
             self.parameters.keys().eq(prototype.parameters.keys()),
@@ -199,7 +452,7 @@ impl Device {
                 value.is_finite() && (min..=max).contains(value),
                 "{key} must be {min}–{max}"
             );
-            if key.ends_with("_type") || key.ends_with("_enabled") {
+            if key.ends_with("_type") || key.ends_with("_enabled") || key.ends_with("_slot") {
                 ensure!(value.fract() == 0.0, "{key} must be an integer");
             }
         }
@@ -207,6 +460,7 @@ impl Device {
     }
 }
 pub const BUILTIN_DEVICES: &[(&str, &str, &str)] = &[
+    ("Beat", "builtin.beat", "Time / volume shaping · 72 slots"),
     ("Gain", "builtin.gain", "Level control"),
     ("EQ Eight", "builtin.eq8", "Eight parametric bands"),
     (
@@ -280,11 +534,41 @@ impl Project {
             .collect()
     }
     pub fn duration_seconds(&self) -> f64 {
-        self.tracks
+        let duration = self
+            .tracks
             .iter()
             .flat_map(|t| &t.clips)
-            .map(|c| c.position.start_beats * 60.0 / self.tempo.bpm + c.position.length_seconds)
-            .fold(0.0, f64::max)
+            .map(|c| {
+                c.position.start_beats * 60.0 / self.tempo.bpm + c.duration_seconds(self.tempo.bpm)
+            })
+            .chain(self.tracks.iter().flat_map(|t| {
+                t.arranged_midi_notes().into_iter().map(move |n| {
+                    (n.start_beats + n.length_beats) * 60.0 / self.tempo.bpm
+                        + t.synth.as_ref().map_or(0.0, |s| {
+                            s.parameters.get("release_ms").copied().unwrap_or(2000.0) / 1000.0
+                        })
+                })
+            }))
+            .chain(
+                self.tracks
+                    .iter()
+                    .filter_map(|t| t.midi_region.clone())
+                    .map(|r| (r.start_beats + r.length_beats) * 60.0 / self.tempo.bpm),
+            )
+            .fold(0.0, f64::max);
+        // ponytail: reserve a bounded effect tail; expose render-tail settings for long reverbs.
+        if duration > 0.0
+            && self
+                .tracks
+                .iter()
+                .flat_map(|t| &t.devices)
+                .chain(&self.master_devices)
+                .any(|d| d.plugin_path().is_some())
+        {
+            duration + 2.0
+        } else {
+            duration
+        }
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -319,7 +603,43 @@ impl Project {
             ensure!(t.id != "master", "Track ID 'master' is reserved");
             ensure!(!t.name.trim().is_empty(), "Track name is empty");
             check_mixer(&t.mixer)?;
+            ensure!(t.notes.len() <= 10000, "Too many MIDI notes");
+            ensure!(
+                (t.notes.is_empty() && t.synth.is_none()) || matches!(t.kind, TrackKind::Midi),
+                "Only MIDI tracks can contain notes or instruments"
+            );
+            if let Some(r) = &t.midi_region {
+                ensure!(
+                    matches!(t.kind, TrackKind::Midi),
+                    "Region requires MIDI track"
+                );
+                ensure!(
+                    r.start_beats.is_finite()
+                        && r.start_beats >= 0.0
+                        && r.offset_beats.is_finite()
+                        && r.offset_beats >= 0.0
+                        && r.length_beats.is_finite()
+                        && r.length_beats >= 0.01,
+                    "Invalid MIDI region"
+                );
+            }
+            if let Some(s) = &t.synth {
+                check_id(&s.id)?;
+                ensure!(
+                    s.kind == "builtin.dot" || s.kind.starts_with("vst3.instrument:"),
+                    "Invalid instrument"
+                );
+                s.validate()?;
+            }
+            for n in &t.notes {
+                n.validate()?;
+            }
             for c in &t.clips {
+                ensure!(
+                    c.source_bpm
+                        .is_none_or(|bpm| bpm.is_finite() && (20.0..=400.0).contains(&bpm)),
+                    "Invalid clip source tempo"
+                );
                 check_id(&c.id)?;
                 for n in [
                     c.position.start_beats,
@@ -363,6 +683,10 @@ impl Project {
             .chain(&self.master_devices)
         {
             check_id(&d.id)?;
+            ensure!(
+                d.kind != "builtin.dot" && !d.kind.starts_with("vst3.instrument:"),
+                "Instrument belongs in the instrument slot"
+            );
             d.validate()?;
         }
         Ok(())
@@ -422,6 +746,37 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    SetArrangementTracks { tracks: Vec<Track> },
+    SetTrackInstrument {
+        track_id: String,
+        kind: Option<String>,
+    },
+    AddMidiTrack {
+        name: String,
+    },
+    SetMidiRegion {
+        track_id: String,
+        region: MidiRegion,
+    },
+    SetMidiNotes {
+        track_id: String,
+        notes: Vec<MidiNote>,
+    },
+    SetMidiScore {
+        track_id: String,
+        notes: Vec<MidiNote>,
+        region: Option<MidiRegion>,
+    },
+    SetPluginState {
+        track_id: String,
+        device_id: String,
+        state: Vec<u8>,
+    },
+    SetSynthParameter {
+        track_id: String,
+        parameter: String,
+        value: f64,
+    },
     AddTrack {
         name: String,
     },
@@ -486,6 +841,11 @@ pub enum Command {
         clip_id: String,
         position: Position,
     },
+    SetClipTempo {
+        track_id: String,
+        clip_id: String,
+        source_bpm: Option<f64>,
+    },
     RelinkClip {
         track_id: String,
         clip_id: String,
@@ -503,6 +863,14 @@ pub enum Command {
         track_id: String,
         device_id: String,
         index: usize,
+    },
+    SetBeatEnvelope {
+        track_id: String,
+        device_id: String,
+        lane: String,
+        slot: usize,
+        /// None restores the factory envelope.
+        points: Option<Vec<beat::BeatPoint>>,
     },
     SetDeviceParameter {
         track_id: String,
@@ -594,6 +962,8 @@ impl Session {
         let before = self.project.clone();
         let mut p = before.clone();
         let label = match &command {
+            Command::SetArrangementTracks { .. } => "Edit arrangement".into(),
+            Command::SetPluginState { track_id, .. } => format!("{track_id}: update VST3 settings"),
             Command::SetTrackVolume {
                 track_id,
                 volume_db,
@@ -654,10 +1024,91 @@ impl Session {
                 .context("Clip not found")
         };
         match command {
+            Command::SetArrangementTracks { tracks } => p.tracks = tracks,
+            Command::SetTrackInstrument { track_id, kind } => {
+                let t = p.track_mut(&track_id)?;
+                ensure!(
+                    matches!(t.kind, TrackKind::Midi),
+                    "Instruments require a MIDI track"
+                );
+                t.synth = kind.map(|k| Device::new(&k)).transpose()?;
+            }
+            Command::AddMidiTrack { name } => p.tracks.push(Track {
+                id: id("track"),
+                name,
+                kind: TrackKind::Midi,
+                synth: None,
+                notes: vec![],
+                midi_region: None,
+                color: [160, 214, 230],
+                mixer: Mixer::default(),
+                clips: vec![],
+                devices: vec![],
+            }),
+            Command::SetMidiRegion { track_id, region } => {
+                let t = p.track_mut(&track_id)?;
+                ensure!(matches!(t.kind, TrackKind::Midi), "Track is not MIDI");
+                t.midi_region = Some(region);
+            }
+            Command::SetMidiNotes { track_id, notes } => {
+                let t = p.track_mut(&track_id)?;
+                ensure!(matches!(t.kind, TrackKind::Midi), "Track is not MIDI");
+                if notes.is_empty() {
+                    t.midi_region = None;
+                }
+                t.notes = notes;
+            }
+            Command::SetMidiScore {
+                track_id,
+                notes,
+                region,
+            } => {
+                let t = p.track_mut(&track_id)?;
+                ensure!(matches!(t.kind, TrackKind::Midi), "Track is not MIDI");
+                t.midi_region = if notes.is_empty() { None } else { region };
+                t.notes = notes;
+            }
+            Command::SetSynthParameter {
+                track_id,
+                parameter,
+                value,
+            } => {
+                let s = p
+                    .track_mut(&track_id)?
+                    .synth
+                    .as_mut()
+                    .context("Track has no instrument")?;
+                s.parameter_range(&parameter)?;
+                s.parameters.insert(parameter, value);
+            }
+            Command::SetPluginState {
+                track_id,
+                device_id,
+                state,
+            } => {
+                let d = if track_id != "master"
+                    && p.track(&track_id)?
+                        .synth
+                        .as_ref()
+                        .is_some_and(|d| d.id == device_id)
+                {
+                    p.track_mut(&track_id)?.synth.as_mut().unwrap()
+                } else {
+                    p.devices_mut(&track_id)?
+                        .iter_mut()
+                        .find(|d| d.id == device_id)
+                        .context("Device not found")?
+                };
+                ensure!(d.plugin_path().is_some(), "Device is not a VST3 plugin");
+                d.plugin_state = state;
+            }
             Command::AddTrack { name } => p.tracks.push(Track {
                 id: id("track"),
                 name,
                 kind: TrackKind::Audio,
+                synth: None,
+                notes: vec![],
+                midi_region: None,
                 color: default_color(),
                 mixer: Mixer::default(),
                 clips: vec![],
@@ -687,6 +1138,7 @@ impl Session {
                 id: id("clip"),
                 source,
                 position,
+                source_bpm: None,
             }),
             Command::RemoveClip { track_id, clip_id } => {
                 let t = p.track_mut(&track_id)?;
@@ -721,6 +1173,15 @@ impl Session {
                 let t = p.track_mut(&track_id)?;
                 let i = clip_mut(t, &clip_id)?;
                 t.clips[i].position = position;
+            }
+            Command::SetClipTempo {
+                track_id,
+                clip_id,
+                source_bpm,
+            } => {
+                let t = p.track_mut(&track_id)?;
+                let i = clip_mut(t, &clip_id)?;
+                t.clips[i].source_bpm = source_bpm;
             }
             Command::RelinkClip {
                 track_id,
@@ -759,6 +1220,30 @@ impl Session {
                 let device = devices.remove(from);
                 devices.insert(index, device);
             }
+            Command::SetBeatEnvelope {
+                track_id,
+                device_id,
+                lane,
+                slot,
+                points,
+            } => {
+                ensure!(
+                    matches!(lane.as_str(), "time" | "volume") && slot < 36,
+                    "Invalid envelope slot"
+                );
+                let d = p
+                    .devices_mut(&track_id)?
+                    .iter_mut()
+                    .find(|d| d.id == device_id)
+                    .context("Device not found")?;
+                ensure!(d.kind == "builtin.beat", "Envelopes require Beat");
+                let key = format!("{lane}:{slot}");
+                if let Some(points) = points {
+                    d.beat_envelopes.insert(key, points);
+                } else {
+                    d.beat_envelopes.remove(&key);
+                }
+            }
             Command::SetDeviceParameter {
                 track_id,
                 device_id,
@@ -796,7 +1281,9 @@ impl Session {
     /// Collapse all updates of one pointer gesture into a single history entry.
     pub fn group_changes(&mut self, before: Project, revisions: u64) {
         let count = (revisions as usize).min(self.history.len());
-        if count > 1 {
+        if count > 0 && self.project == before {
+            self.history.truncate(self.history.len() - count);
+        } else if count > 1 {
             let label = self.history.last().unwrap().label.clone();
             self.history.truncate(self.history.len() - count);
             self.history.push(HistoryEntry {
@@ -1066,5 +1553,204 @@ mod tests {
             .is_err());
         s.project.tracks[0].id = s.project.project.id.clone();
         assert!(s.project.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod midi_tests {
+    use super::*;
+    #[test]
+    fn score_properties_are_compatible_atomic_and_undoable() {
+        let legacy: MidiNote = serde_json::from_str(
+            r#"{"key":60,"velocity":100,"start_beats":0.0,"length_beats":1.0}"#,
+        )
+        .unwrap();
+        assert!(!legacy.muted);
+        assert_eq!(legacy.channel, 1);
+        let mut s = Session::new(Project::new("Score"), PathBuf::new());
+        s.execute(Command::AddMidiTrack {
+            name: "Keys".into(),
+        })
+        .unwrap();
+        let id = s.project.tracks[0].id.clone();
+        let region = Some(MidiRegion {
+            start_beats: 8.0,
+            offset_beats: 0.0,
+            length_beats: 4.0,
+        });
+        let notes = vec![
+            MidiNote {
+                muted: true,
+                channel: 16,
+                ..legacy.clone()
+            },
+            legacy,
+        ];
+        s.execute(Command::SetMidiScore {
+            track_id: id.clone(),
+            notes: notes.clone(),
+            region: region.clone(),
+        })
+        .unwrap();
+        assert_eq!(s.project.tracks[0].arranged_midi_notes().len(), 1);
+        let snapshot = s.project.clone();
+        let mut invalid = notes.clone();
+        invalid[0].channel = 17;
+        assert!(s
+            .execute(Command::SetMidiScore {
+                track_id: id.clone(),
+                notes: invalid,
+                region: None
+            })
+            .is_err());
+        assert_eq!(s.project, snapshot);
+        let encoded = serde_yaml::to_string(&snapshot).unwrap();
+        let restored: Project = serde_yaml::from_str(&encoded).unwrap();
+        assert_eq!(restored, snapshot);
+        s.execute(Command::SetMidiScore {
+            track_id: id,
+            notes: vec![],
+            region: None,
+        })
+        .unwrap();
+        assert!(s.project.tracks[0].notes.is_empty());
+        assert!(s.undo());
+        assert_eq!(s.project, snapshot);
+    }
+    #[test]
+    fn midi_edits_validate_undo_and_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::new(Project::new("MIDI"), root.path().to_path_buf());
+        session
+            .execute(Command::AddMidiTrack { name: "Dot".into() })
+            .unwrap();
+        let track_id = session.project.tracks[0].id.clone();
+        session
+            .execute(Command::SetMidiNotes {
+                track_id: track_id.clone(),
+                notes: vec![MidiNote {
+                    key: 60,
+                    velocity: 100,
+                    start_beats: 0.0,
+                    length_beats: 1.0,
+                    ..MidiNote::default()
+                }],
+            })
+            .unwrap();
+        assert!(session.project.tracks[0].synth.is_none());
+        session
+            .execute(Command::SetTrackInstrument {
+                track_id: track_id.clone(),
+                kind: Some("builtin.dot".into()),
+            })
+            .unwrap();
+        let snapshot = session.project.clone();
+        session
+            .execute(Command::SetTrackInstrument {
+                track_id: track_id.clone(),
+                kind: None,
+            })
+            .unwrap();
+        assert_eq!(session.project.tracks[0].notes, snapshot.tracks[0].notes);
+        assert!(session.undo());
+        assert!(session
+            .execute(Command::SetSynthParameter {
+                track_id: track_id.clone(),
+                parameter: "wave_type".into(),
+                value: 1.5
+            })
+            .is_err());
+        assert_eq!(session.project, snapshot);
+        session
+            .execute(Command::SetSynthParameter {
+                track_id,
+                parameter: "sustain".into(),
+                value: 0.4,
+            })
+            .unwrap();
+        assert!(session.undo());
+        assert_eq!(session.project, snapshot);
+        let loaded: Project =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        loaded.validate().unwrap();
+        assert_eq!(loaded, snapshot);
+        assert!(loaded.duration_seconds() > 0.5);
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+    #[test]
+    fn plugin_roles_state_history_and_project_roundtrip() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Test.vst3");
+        let instrument = format!("vst3.instrument:{}", path.display());
+        let effect = format!("vst3.effect:{}", path.display());
+        let mut session = Session::new(Project::new("Plugins"), root.path().into());
+        session
+            .execute(Command::AddMidiTrack {
+                name: "MIDI".into(),
+            })
+            .unwrap();
+        let track_id = session.project.tracks[0].id.clone();
+        session
+            .execute(Command::SetTrackInstrument {
+                track_id: track_id.clone(),
+                kind: Some(instrument.clone()),
+            })
+            .unwrap();
+        let id = session.project.tracks[0].synth.as_ref().unwrap().id.clone();
+        session
+            .execute(Command::SetPluginState {
+                track_id: track_id.clone(),
+                device_id: id,
+                state: vec![0, 1, 255],
+            })
+            .unwrap();
+        assert!(session.undo());
+        assert!(session.project.tracks[0]
+            .synth
+            .as_ref()
+            .unwrap()
+            .plugin_state
+            .is_empty());
+        assert!(session.redo());
+        let before = session.project.clone();
+        assert!(session
+            .execute(Command::AddDevice {
+                track_id: track_id.clone(),
+                kind: instrument
+            })
+            .is_err());
+        assert_eq!(session.project, before);
+        assert!(session
+            .execute(Command::SetTrackInstrument {
+                track_id: track_id.clone(),
+                kind: Some(effect.clone())
+            })
+            .is_err());
+        assert_eq!(session.project, before);
+        session
+            .execute(Command::AddDevice {
+                track_id: "master".into(),
+                kind: effect,
+            })
+            .unwrap();
+        let id = session.project.master_devices[0].id.clone();
+        session
+            .execute(Command::SetPluginState {
+                track_id: "master".into(),
+                device_id: id,
+                state: vec![33, 99],
+            })
+            .unwrap();
+        save(root.path(), &session.project).unwrap();
+        assert_eq!(load(root.path()).unwrap(), session.project);
+        let mut invalid = Device::new("vst3.effect:relative.vst3").unwrap();
+        assert!(invalid.validate().is_err());
+        invalid = Device::new("builtin.gain").unwrap();
+        invalid.plugin_state = vec![1];
+        assert!(invalid.validate().is_err());
     }
 }
