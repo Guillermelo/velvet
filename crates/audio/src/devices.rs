@@ -12,29 +12,69 @@ pub const EQ_FILTER_TYPES: [&str; 6] = [
 
 pub(crate) fn process_devices(frames: &mut [[f32; 2]], devices: &[Device], rate: u32) {
     for device in devices {
+        if device.kind == "builtin.limiter" {
+            limiter(frames, device, rate);
+        } else {
+            DeviceProcessor::new(device, rate).process(frames);
+        }
+    }
+}
+
+/// Stateful gain, EQ and compressor processing. Construct on the DSP owner
+/// thread after project validation, then reuse across blocks. Construction is
+/// the reset boundary; processing neither allocates nor reads project state.
+pub(crate) enum DeviceProcessor {
+    Gain(f32),
+    Eq {
+        filters: Vec<[Biquad; 2]>,
+        output: f32,
+    },
+    Compressor(Compressor),
+}
+
+impl DeviceProcessor {
+    pub(crate) fn new(device: &Device, rate: u32) -> Self {
         let p = &device.parameters;
         match device.kind.as_str() {
-            "builtin.gain" => gain(frames, db(p["gain_db"])),
-            "builtin.eq" => {
-                for (key, frequency) in [
+            "builtin.gain" => Self::Gain(db(p["gain_db"])),
+            "builtin.eq" => Self::Eq {
+                filters: [
                     ("low_gain_db", 120.0),
                     ("mid_gain_db", 1000.0),
                     ("high_gain_db", 6000.0),
-                ] {
-                    if p[key] != 0.0 {
-                        filter_frames(frames, Biquad::peak(rate, frequency, p[key]));
+                ]
+                .into_iter()
+                .filter(|(key, _)| p[*key] != 0.0)
+                .map(|(key, frequency)| [Biquad::peak(rate, frequency, p[key]); 2])
+                .collect(),
+                output: 1.0,
+            },
+            "builtin.eq8" => Self::Eq {
+                filters: eq8_filters(device, rate)
+                    .into_iter()
+                    .map(|f| [f; 2])
+                    .collect(),
+                output: db(p["output_gain_db"]),
+            },
+            "builtin.compressor" => Self::Compressor(Compressor::new(device, rate)),
+            _ => unreachable!("Only validated gain, EQ and compressor devices are supported"),
+        }
+    }
+
+    pub(crate) fn process(&mut self, frames: &mut [[f32; 2]]) {
+        match self {
+            Self::Gain(value) => gain(frames, *value),
+            Self::Eq { filters, output } => {
+                for filter in filters {
+                    for frame in frames.iter_mut() {
+                        for (sample, channel) in frame.iter_mut().zip(filter.iter_mut()) {
+                            *sample = channel.process(*sample);
+                        }
                     }
                 }
+                gain(frames, *output);
             }
-            "builtin.eq8" => {
-                for filter in eq8_filters(device, rate) {
-                    filter_frames(frames, filter);
-                }
-                gain(frames, db(p["output_gain_db"]));
-            }
-            "builtin.compressor" => compressor(frames, device, rate),
-            "builtin.limiter" => limiter(frames, device, rate),
-            _ => unreachable!("Device kind is validated before rendering"),
+            Self::Compressor(compressor) => compressor.process(frames),
         }
     }
 }
@@ -42,14 +82,6 @@ fn gain(frames: &mut [[f32; 2]], value: f32) {
     for frame in frames {
         for sample in frame {
             *sample *= value;
-        }
-    }
-}
-fn filter_frames(frames: &mut [[f32; 2]], filter: Biquad) {
-    let mut filters = [filter; 2];
-    for frame in frames {
-        for (sample, filter) in frame.iter_mut().zip(&mut filters) {
-            *sample = filter.process(*sample);
         }
     }
 }
@@ -88,31 +120,61 @@ pub fn eq_response(device: &Device, frequencies: &[f64], rate: u32) -> Vec<f64> 
         .collect()
 }
 
-fn compressor(frames: &mut [[f32; 2]], device: &Device, rate: u32) {
-    let p = &device.parameters;
-    let attack = (-1.0 / (rate as f64 * p["attack_ms"] * 0.001)).exp();
-    let release = (-1.0 / (rate as f64 * p["release_ms"] * 0.001)).exp();
-    let mut reduction = 0.0;
-    for frame in frames {
-        // Linked stereo peak detector preserves the stereo balance.
-        let level = 20.0
-            * f64::from(frame[0].abs().max(frame[1].abs()))
-                .max(1e-12)
-                .log10();
-        let over = level - p["threshold_db"];
-        let knee = p["knee_db"];
-        let slope = 1.0 - 1.0 / p["ratio"];
-        let target = if knee > 0.0 && over > -knee / 2.0 && over < knee / 2.0 {
-            slope * (over + knee / 2.0).powi(2) / (2.0 * knee)
-        } else {
-            slope * over.max(0.0)
-        };
-        let coefficient = if target > reduction { attack } else { release };
-        reduction = coefficient * reduction + (1.0 - coefficient) * target;
-        let value = db(p["makeup_db"] - reduction);
-        frame[0] *= value;
-        frame[1] *= value;
+pub(crate) struct Compressor {
+    attack: f64,
+    release: f64,
+    reduction: f64,
+    threshold: f64,
+    knee: f64,
+    slope: f64,
+    makeup: f64,
+}
+
+impl Compressor {
+    fn new(device: &Device, rate: u32) -> Self {
+        let p = &device.parameters;
+        Self {
+            attack: (-1.0 / (rate as f64 * p["attack_ms"] * 0.001)).exp(),
+            release: (-1.0 / (rate as f64 * p["release_ms"] * 0.001)).exp(),
+            reduction: 0.0,
+            threshold: p["threshold_db"],
+            knee: p["knee_db"],
+            slope: 1.0 - 1.0 / p["ratio"],
+            makeup: p["makeup_db"],
+        }
     }
+
+    fn process(&mut self, frames: &mut [[f32; 2]]) {
+        for frame in frames {
+            // Linked stereo peak detector preserves the stereo balance.
+            let level = 20.0
+                * f64::from(frame[0].abs().max(frame[1].abs()))
+                    .max(1e-12)
+                    .log10();
+            let over = level - self.threshold;
+            let knee = self.knee;
+            let slope = self.slope;
+            let target = if knee > 0.0 && over > -knee / 2.0 && over < knee / 2.0 {
+                slope * (over + knee / 2.0).powi(2) / (2.0 * knee)
+            } else {
+                slope * over.max(0.0)
+            };
+            let coefficient = if target > self.reduction {
+                self.attack
+            } else {
+                self.release
+            };
+            self.reduction = coefficient * self.reduction + (1.0 - coefficient) * target;
+            let value = db(self.makeup - self.reduction);
+            frame[0] *= value;
+            frame[1] *= value;
+        }
+    }
+}
+
+#[cfg(test)]
+fn compressor(frames: &mut [[f32; 2]], device: &Device, rate: u32) {
+    Compressor::new(device, rate).process(frames);
 }
 fn limiter(frames: &mut [[f32; 2]], device: &Device, rate: u32) {
     let input = db(device.parameters["input_gain_db"]);
@@ -230,6 +292,64 @@ impl Biquad {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persistent_devices_preserve_filter_tails_and_compressor_release_across_blocks() {
+        for kind in [
+            "builtin.gain",
+            "builtin.eq",
+            "builtin.eq8",
+            "builtin.compressor",
+        ] {
+            let mut device = Device::new(kind).unwrap();
+            match kind {
+                "builtin.eq" => {
+                    device.parameters.insert("low_gain_db".into(), 12.0);
+                }
+                "builtin.eq8" => {
+                    device.parameters.insert("band3_gain_db".into(), -9.0);
+                }
+                "builtin.compressor" => {
+                    device.parameters.insert("threshold_db".into(), -30.0);
+                }
+                _ => {
+                    device.parameters.insert("gain_db".into(), -6.0);
+                }
+            }
+            for rate in [8000, 44100, 48000, 192000] {
+                let mut input = vec![[0.01, -0.005]; 4097];
+                // Transients on either side of common block boundaries, followed
+                // by a quiet tail that exposes resetting filters or release.
+                for i in [0, 63, 64, 255, 256, 511, 512] {
+                    input[i] = [1.0, -0.5];
+                }
+                let mut reference = input.clone();
+                process_devices(&mut reference, std::slice::from_ref(&device), rate);
+                for block_size in [1, 63, 256, 511, 1024] {
+                    let mut actual = input.clone();
+                    let mut processor = DeviceProcessor::new(&device, rate);
+                    processor.process(&mut []);
+                    for block in actual.chunks_mut(block_size) {
+                        processor.process(block);
+                    }
+                    assert_eq!(actual, reference, "{kind}, {rate} Hz, block {block_size}");
+                }
+                if kind != "builtin.gain" {
+                    let mut restarted = input.clone();
+                    for block in restarted.chunks_mut(64) {
+                        DeviceProcessor::new(&device, rate).process(block);
+                    }
+                    assert!(
+                        restarted
+                            .iter()
+                            .zip(&reference)
+                            .any(|(a, b)| (a[0] - b[0]).abs() > 1e-6),
+                        "Fixture must detect state loss: {kind}, {rate} Hz"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn compressor_ratio_attack_release_knee_and_stereo_link() {
         let mut device = Device::new("builtin.compressor").unwrap();
